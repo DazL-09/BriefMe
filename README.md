@@ -1,7 +1,7 @@
 # HearMeOut — BriefME · Clinical Journaling Copilot (IBM Bob + Langflow)
 
-Implementasi `Agent-Plan.md` untuk hackathon: **engine IBM Bob (API key resmi) +
-Langflow sebagai orkestrasi** — domain BriefME. Produk berjalan lewat **SATU flow
+Implementasi untuk hackathon: **engine IBM Bob (API key resmi) + Langflow
+sebagai orkestrasi** — domain BriefME. Produk berjalan lewat **SATU flow
 Langflow multi-mode** (analisis / saran alternatif via awalan input) dan riwayat
 curhatan disimpan pada stack **MERN (MongoDB + Express + React)**. Dokumen
 `.docx` dibuat **di browser** (library `docx` + `file-saver`) — tanpa AI/MCP.
@@ -60,13 +60,10 @@ curhatan disimpan pada stack **MERN (MongoDB + Express + React)**. Dokumen
 | 3 — History API | `server/index.js`, `server/package.json` | Express + Mongoose (:8790) — CRUD `/api/history` + guardrail G5 |
 | 4 — E2E test | `scripts/run_e2e.py` | preflight → F1 → F3 (prefix) → roundtrip history |
 | 5 — Web (UI) | `web/` (React + Vite + TS + `docx` + `file-saver`) | alur 3 tahap + panel Riwayat + pembuatan `.docx` lokal; proxy `/api/history` → Express, `/api` → Langflow |
-| Arsip | `mcp_server.py`, `template_cbt.docx`, `make_template.py`, `.bob/mcp.json` | jalur MCP lama — **tidak lagi dipakai produk** (docx kini di browser); disimpan sebagai arsip |
 
 ## Setup
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
 cp .env.example .env                     # lalu isi LANGFLOW_API_KEY, BOB_API_KEY
 
 cd server && npm install                 # dependensi Express/Mongoose
@@ -146,8 +143,8 @@ Pikiran Alternatif`, sel alt kosong); output alternatif = satu paragraf saran.
   builder**, lalu verifikasi jumlah node flow = `6` (id: `.flow_id` fb741b8a…).
 * **Sel alt `&nbsp;`.** Bob kadang menulis `&nbsp;` untuk sel kosong — UI dan
   e2e menormalisasi jadi kosong (prompt analisis juga melarangnya).
-* **Tanpa sensor lokal (keputusan 9 Okt).** Input dianggap tanpa data pribadi;
-  PII jadi guard regex di e2e. Riwayat iterasi di `AGENT_LOG.md` bag.3–8.
+* **Tanpa sensor lokal.** Input dianggap tanpa data pribadi; PII jadi guard
+  regex di e2e.
 * **Web UI (`web/`).** React + Vite + TypeScript + framer-motion + `docx` +
   `file-saver`; footer transparansi AI di halaman; `npm run build` lolos
   (tsc + vite).
@@ -161,5 +158,3 @@ Pikiran Alternatif`, sel alt kosong); output alternatif = satu paragraf saran.
   catatan objektif-klinis), riwayat buka/pulihkan
 * Dokumen hasil: unduhan browser `briefme-thought-record-*.docx`
 * Log Langflow: `tail -f /tmp/langflow-server.log`
-* Keputusan & angka ukur: `AGENT_LOG.md` (bag.19 3-flow era, bag.20 konsolidasi
-  1-flow)

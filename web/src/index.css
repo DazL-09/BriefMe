@@ -159,14 +159,6 @@ th {
   background: #eef1f5;
 }
 
-.raw {
-  background: #f2f4f7;
-  border-radius: 8px;
-  padding: 12px 14px;
-  overflow-x: auto;
-  white-space: pre-wrap;
-}
-
 .doc-path code {
   word-break: break-all;
 }
@@ -286,9 +278,6 @@ button.danger:hover:not(:disabled) {
     background: #14171b;
     color: #e8eaed;
     border-color: #3a414a;
-  }
-  .raw {
-    background: #14171b;
   }
   th {
     background: #232830;

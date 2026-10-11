@@ -28,7 +28,6 @@ type FlowResponse = {
 type ThoughtRecord = {
   headers: string[]
   rows: string[][]
-  raw: string
 }
 
 type Analysis = {
@@ -96,7 +95,7 @@ function parseThoughtRecord(md: string): ThoughtRecord {
       rows.push(toCells(line))
     }
   }
-  return { headers, rows, raw: md }
+  return { headers, rows }
 }
 
 /** G1 (klien) — validasi curhatan sebelum memanggil model. */
@@ -180,7 +179,7 @@ async function historyRequest(
   method: string,
   path: string,
   body?: unknown,
-): Promise<{ ok: boolean; status: number; data: unknown }> {
+): Promise<{ ok: boolean; data: unknown }> {
   try {
     const res = await fetch(`/api/history${path}`, {
       method,
@@ -188,9 +187,9 @@ async function historyRequest(
       body: body === undefined ? undefined : JSON.stringify(body),
     })
     const data = await res.json().catch(() => ({}))
-    return { ok: res.ok, status: res.status, data }
+    return { ok: res.ok, data }
   } catch (e) {
-    return { ok: false, status: 0, data: { error: e instanceof Error ? e.message : String(e) } }
+    return { ok: false, data: { error: e instanceof Error ? e.message : String(e) } }
   }
 }
 
@@ -448,7 +447,6 @@ export default function App() {
           item.alternateThought.text,
         ],
       ],
-      raw: '',
     })
     setAnalysis(item.analysis)
     setAlt({
@@ -475,9 +473,8 @@ export default function App() {
     void refreshHistory()
   }
 
-  const busyLabel: Record<Exclude<Busy, null>, string> = {
+  const busyLabel: Record<'analyze' | 'doc', string> = {
     analyze: 'Menganalisis…',
-    ai: 'Bob menyarankan…',
     doc: 'Membuat dokumen…',
   }
   const busyHint: Record<Exclude<Busy, null>, string> = {
@@ -618,39 +615,35 @@ export default function App() {
               transition={{ type: 'spring', duration: 0.45, bounce: 0 }}
             >
               <h2>Thought Record</h2>
-              {record.rows.length > 0 ? (
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        {record.headers.map((h) => (
-                          <th key={h}>{h}</th>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      {record.headers.map((h) => (
+                        <th key={h}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {record.rows.map((row, i) => (
+                      <tr key={i}>
+                        {row.map((cell, j) => (
+                          <td key={j}>
+                            {j === 4 && alt.text ? (
+                              <span className="alt-cell">
+                                {alt.text}
+                                {alt.source === 'ai' && <span className="badge">AI</span>}
+                              </span>
+                            ) : (
+                              cell || '—'
+                            )}
+                          </td>
                         ))}
                       </tr>
-                    </thead>
-                    <tbody>
-                      {record.rows.map((row, i) => (
-                        <tr key={i}>
-                          {row.map((cell, j) => (
-                            <td key={j}>
-                              {j === 4 && alt.text ? (
-                                <span className="alt-cell">
-                                  {alt.text}
-                                  {alt.source === 'ai' && <span className="badge">AI</span>}
-                                </span>
-                              ) : (
-                                cell || '—'
-                              )}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <pre className="raw">{record.raw}</pre>
-              )}
+                    ))}
+                  </tbody>
+                </table>
+              </div>
 
               {/* Langkah berikutnya: pikiran alternatif (guardrail: AI tidak mengisi
                   otomatis — pasien memilih tulis manual atau minta saran AI).

@@ -73,20 +73,16 @@ PII_PATTERNS = {
 }
 # header tabel Markdown (output)
 TABLE_HEADERS = ["Situasi", "Pikiran", "Emosi", "Perilaku", "Pikiran Alternatif"]
-# nilai pengganti yang berarti "tidak ada isi", bukan hasil ekstraksi nyata
-PLACEHOLDERS = ("tidak disebutkan", "tidak ada", "n/a", "-", "tidak diketahui")
 # potongan prompt (builder) yang tidak boleh bocor ke output flow
 INSTRUCTION_FRAGMENTS = [
     "langkah wajib",
     "analisis teks secara internal",
     "objek json dari langkah",
     "satu baris data per situasi",
-    "hasil restrukturisasi kognitif ringan",
+    "gaya restrukturisasi kognitif ringan",
     "identitas pasien",
-    "panggilan tool",
-    "generate_clinical_document",
+    "memanggil tool",
     "saran medis",
-    "hanya dengan satu baris",
     "tanpa teks lain",
 ]
 
