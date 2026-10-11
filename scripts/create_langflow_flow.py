@@ -1,32 +1,48 @@
-"""Tahap 1 — buat/update flow Langflow "BriefME" (node native, tanpa kode Python custom).
+"""Buat/update flow Langflow "BriefME" — dua engine (--engine bob|gemini, default bob).
 
-Rantai node (5 node / 4 edge):
-    Chat Input ─────────────→ Agent ──→ Chat Output "Thought Record"
-    Google Generative AI ───→ (model)     (tabel Markdown + Dokumen: <path>)
-    MCP Tools (:8788) ──────→ (tools)
+Engine bob (utama — arsitektur hackathon: Bob + Langflow, MCP di sisi Bob):
+    6 node / 5 edge:
+        Chat Input ──→ Prompt ──→ Python Interpreter ──→ Parse JSON ──→ Parser ──→ Chat Output
+        (jurnal)      (kode       (subprocess bob run    (jq: ambil      (format    "Thought Record"
+                       CBT +       via API resmi,         last_message)   {text})
+                       {text})     tool MCP lewat
+                                   .bob/mcp.json)
+    Python Interpreter memanggil `bob run --mode agent --format json` (kunci dari
+    .env BOB_API_KEY); Bob berbicara ke MCP hearmeout-tools (mcp_server.py :8788)
+    lewat .bob/mcp.json sehingga dokumen .docx dibuat oleh Bob sendiri.
 
-Otak CBT = node Agent berbasis Gemini (kunci dari variabel GOOGLE_API_KEY).
-Tool dokumen = MCP server "hearmeout-tools" (mcp_server.py, port 8788) yang sama
-dipakai Bob dulu — kini dipanggil langsung oleh Langflow lewat node MCP Tools.
-Tidak ada Python Interpreter, tidak ada bob CLI / npm Bob.
+Engine gemini (cadangan — arsitektur lama, MCP lewat node Langflow):
+    5 node / 4 edge: Chat Input → Agent (+Google Generative AI + MCP Tools) → Chat Output.
+    Flow ini disimpan terpisah "BriefME (Gemini)" endpoint briefme-gemini; saat pertama
+    kali engine bob dijalankan, flow Gemini yang ada di-CLONE ke sana sebelum data
+    primary (endpoint briefme) ditimpa dengan data bob.
 
 Catatan implementasi (mengikuti lfx.graph.flow_builder.connect):
 - Node sumber tool harus "flipped" ke tool mode: template.tool_mode=True dan
   outputs diganti output sintetis component_as_tool (method to_toolkit).
 - Edge memakai id reactflow__edge-… dan handle string dengan œ (U+0153)
   sebagai pengganti kutip — format yang dipakai kanvas & connect.py resmi.
+- Prompt template adalah KODE python (str.format, satu-satunya variabel {text});
+  output Prompt (Message berisi kode ter-render) menimpa field python_code di
+  runtime — nilai tersimpan di template hanya untuk tampilan UI.
+- Python Interpreter sandbox: TANPA pernyataan import dalam kode (validate_code_safety
+  menolak ast.Import); module datang dari field global_imports ("math,os,subprocess")
+  dan builtins tidak memuat open() — fallback kunci BOB dibaca via subprocess cat.
 
 Pemakaian:
     set -a; . ./.env; set +a
-    python scripts/create_langflow_flow.py
+    python scripts/create_langflow_flow.py                # engine bob (default)
+    python scripts/create_langflow_flow.py --engine gemini  # flow cadangan Gemini
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from copy import deepcopy
 from pathlib import Path
@@ -56,6 +72,37 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # adalah NAMA variabel global Langflow (bukan kunci literal). Builder menyinkronkan
 # nilai .env → variabel ini lewat API (dienkripsi di database Langflow).
 GEMINI_VAR_NAME = "GOOGLE_API_KEY"
+
+# ---- Engine Bob (utama) vs Gemini (cadangan) --------------------------------
+# Primary: "BriefME" endpoint briefme (data bob bila engine bob pernah jalan).
+FALLBACK_FLOW_NAME = "BriefME (Gemini)"
+FALLBACK_ENDPOINT = "briefme-gemini"
+FLOW_ID_GEMINI = ".flow_id.gemini"
+
+DESC_BOB = ("BriefME — Thought Record CBT dari jurnal pasien "
+            "(Langflow orkestrasi + Bob CLI via API resmi, MCP di sisi Bob)")
+DESC_GEMINI = ("BriefME (Gemini) — cadangan arsitektur Gemini "
+               "(Langflow Agent + MCP hearmeout-tools)")
+
+BOB_IDS = {
+    "chat_input": "ChatInput-HEARB1",
+    "prompt": "Prompt-HEARB2",
+    "python": "PythonREPL-HEARB3",
+    "parse_json": "ParseJSONData-HEARB4",
+    "parser": "Parser-HEARB5",
+    "chat_output": "ChatOutput-HEARB6",
+}
+
+# Ambil last_message dari output `bob run --format json` (String.data stdout),
+# tahan terhadap noise sebelum JSON dan pagar code fence; sudah lolos
+# validate_jq_program Langflow + 8 kasus uji (murni/noise/fence/gagal/kosong/…).
+JQ_LAST_MESSAGE = (
+    '(.result // "BOB_GAGAL: output kosong") '
+    '| (try (fromjson | .last_message) catch null) '
+    '// (try (capture("(?<j>\\\\{.*") | .j | fromjson | .last_message) catch null) '
+    '// . '
+    '| if type == "string" then (gsub("```[a-z]*"; "") | ltrimstr("\\n")) else tostring end'
+)
 
 IDs = {
     "chat_input": "ChatInput-HEAR1",
@@ -279,7 +326,119 @@ def sync_gemini_variable(key: str) -> bool:
     return True
 
 
-def build_flow() -> dict:
+def build_python_code_template() -> str:
+    """Susun kode Python node Python Interpreter (template dengan {text}).
+
+    Kode dijalankan sandbox Langflow: tanpa pernyataan import (validate_code_safety
+    menolak ast.Import — module dari global_imports), tanpa open() (builtins tak
+    memilikinya) — fallback kunci BOB dibaca via `subprocess cat .env`.
+    Satu-satunya kurung kurawal di seluruh kode adalah placeholder {text} yang
+    dirender oleh node Prompt (str.format).
+    """
+    instr = AGENT_SYSTEM_PROMPT
+    assert "{" not in instr and "}" not in instr, "AGENT_SYSTEM_PROMPT memuat kurung kurawal"
+    assert "'''" not in instr, "AGENT_SYSTEM_PROMPT memuat tiga kutip"
+    code = (
+        f"PROJECT = {str(BASE)!r}\n"
+        "BOB = os.path.expanduser('~/.local/share/npm/bin/bob')\n"
+        "env = os.environ.copy()\n"
+        "if not env.get('BOB_API_KEY'):\n"
+        "    try:\n"
+        "        cat = subprocess.run(['cat', PROJECT + '/.env'], capture_output=True, text=True, timeout=10)\n"
+        "        for ln in cat.stdout.splitlines():\n"
+        "            if ln.startswith('BOB_API_KEY='):\n"
+        "                env['BOB_API_KEY'] = ln.split('=', 1)[1]\n"
+        "            if ln.startswith('BOB_MAX_TURNS='):\n"
+        "                env['BOB_MAX_TURNS'] = ln.split('=', 1)[1]\n"
+        "    except Exception as e:\n"
+        "        print('BOB_GAGAL env: %s' % e)\n"
+        "if not env.get('BOB_MAX_TURNS'):\n"
+        "    env['BOB_MAX_TURNS'] = '6'\n"
+        "INSTR = '''\n" + instr + "\n'''\n"
+        "prompt = INSTR + '\\n\\nJurnal pasien (teks pengguna):\\n' + '''{text}'''\n"
+        "try:\n"
+        "    p = subprocess.run([BOB, 'run', '--accept-license', '--mode', 'agent', '--format', 'json', "
+        "'--log-level', 'error', '--trust', '--workspace', PROJECT, '--max-turns', env.get('BOB_MAX_TURNS', '6'), "
+        "'--disable-subagents', prompt], input='', capture_output=True, text=True, timeout=900, env=env, cwd=PROJECT)\n"
+        "    out = p.stdout.strip()\n"
+        "    if out:\n"
+        "        print(out)\n"
+        "    else:\n"
+        "        print('BOB_GAGAL rc=%d %s' % (p.returncode, p.stderr.strip()[:400]))\n"
+        "except Exception as e:\n"
+        "    print('BOB_GAGAL: %s' % e)\n"
+    )
+    rest = code.replace("{text}", "")
+    assert "{" not in rest and "}" not in rest, "template memuat kurung kurawal selain {text}"
+    return code
+
+
+def build_flow_bob() -> dict:
+    """Flow 6 node / 5 edge — engine Bob (arsitektur utama hackathon)."""
+    catalog = api("GET", "/api/v1/all")
+
+    chat_in = catalog_entry(catalog, "input_output", "ChatInput")
+    prompt = catalog_entry(catalog, "models_and_agents", "Prompt Template")
+    python_repl = catalog_entry(catalog, "utilities", "PythonREPLComponent")
+    parse_json = catalog_entry(catalog, "processing", "ParseJSONData")
+    parser = catalog_entry(catalog, "processing", "ParserComponent")
+    chat_out = catalog_entry(catalog, "input_output", "ChatOutput")
+
+    code_template = build_python_code_template()
+
+    # --- Prompt: template = kode python bob; field dinamis {text} sebagai tujuan
+    # edge Chat Input (bentuk field mengikuti DefaultPromptField.to_dict()).
+    prompt["template"]["template"]["value"] = code_template
+    prompt["template"]["text"] = {
+        "field_type": "str", "required": False, "placeholder": "", "list": False,
+        "show": True, "multiline": True, "value": "", "fileTypes": [], "file_path": "",
+        "name": "text", "display_name": "text", "advanced": False, "api_editable": False,
+        "input_types": ["Message"], "dynamic": False, "info": "", "load_from_db": False,
+        "title_case": False, "type": "str",
+    }
+    prompt["custom_fields"] = {"template": ["text"]}
+    if "text" not in prompt.get("field_order", []):
+        prompt["field_order"] = list(prompt.get("field_order", [])) + ["text"]
+
+    # --- Python Interpreter: sandbox global_imports + kode template (nilai ini
+    # ditimpa output Prompt saat run; disimpan agar UI menampilkan rantai jelas).
+    python_repl["template"]["python_code"]["value"] = code_template
+    python_repl["template"]["global_imports"]["value"] = "math,os,subprocess"
+
+    # --- Parse JSON: jq ambil last_message dari output bob run --format json
+    parse_json["template"]["query"]["value"] = JQ_LAST_MESSAGE
+
+    # --- Parser: format tabel dari baris Data (satu Data per baris jq)
+    parser["template"]["pattern"]["value"] = "{text}"
+
+    # --- Chat Output: "Thought Record" (tabel Markdown + baris Dokumen: <path>)
+    chat_out["display_name"] = "Thought Record"
+
+    nodes = [
+        node(chat_in, "ChatInput", BOB_IDS["chat_input"], [0, 300]),
+        node(prompt, "Prompt Template", BOB_IDS["prompt"], [360, 300]),
+        node(python_repl, "PythonREPLComponent", BOB_IDS["python"], [940, 300]),
+        node(parse_json, "ParseJSONData", BOB_IDS["parse_json"], [1520, 300]),
+        node(parser, "ParserComponent", BOB_IDS["parser"], [1980, 300]),
+        node(chat_out, "ChatOutput", BOB_IDS["chat_output"], [2380, 300]),
+    ]
+    edges = [
+        edge(BOB_IDS["chat_input"], "message", ["Message"], "ChatInput",
+             BOB_IDS["prompt"], "text", ["Message"], "str"),
+        edge(BOB_IDS["prompt"], "prompt", ["Message"], "Prompt Template",
+             BOB_IDS["python"], "python_code", ["Message"], "str"),
+        edge(BOB_IDS["python"], "results", ["JSON"], "PythonREPLComponent",
+             BOB_IDS["parse_json"], "input_value", ["Message", "Data", "JSON"], "other"),
+        edge(BOB_IDS["parse_json"], "filtered_data", ["JSON"], "ParseJSONData",
+             BOB_IDS["parser"], "input_data", ["DataFrame", "Table", "Data", "JSON"], "other"),
+        edge(BOB_IDS["parser"], "parsed_text", ["Message"], "ParserComponent",
+             BOB_IDS["chat_output"], "input_value",
+             ["Data", "JSON", "DataFrame", "Table", "Message"], "other"),
+    ]
+    return {"nodes": nodes, "edges": edges, "viewport": {"x": 0, "y": 0, "zoom": 1}}
+
+
+def build_flow_gemini() -> dict:
     catalog = api("GET", "/api/v1/all")
 
     chat_in = catalog_entry(catalog, "input_output", "ChatInput")
@@ -356,39 +515,103 @@ def find_existing_flow() -> dict | None:
     return None
 
 
+def is_gemini_style(flow: dict) -> bool:
+    """True bila data flow memuat node Google Generative AI (arsitektur cadangan).
+
+    Pakai "GoogleGenerativeAI" (nama komponen) — jangan "GoogleGenAI": itu bukan
+    substring dari "GoogleGenerativeAIComponent" (ada huruf 'e' setelah 'Gen').
+    """
+    return "GoogleGenerativeAI" in json.dumps(flow.get("data") or {})
+
+
+def find_fallback_flow() -> dict | None:
+    """Cari flow cadangan Gemini ("BriefME (Gemini)") via .flow_id.gemini / nama."""
+    path = BASE / FLOW_ID_GEMINI
+    if path.exists():
+        flow_id = path.read_text().strip()
+        if flow_id:
+            try:
+                flow = api("GET", f"/api/v1/flows/{flow_id}")
+                if isinstance(flow, dict) and flow.get("id"):
+                    return flow
+            except SystemExit:
+                pass
+    name = urllib.parse.quote(FALLBACK_FLOW_NAME)
+    flows = api("GET", f"/api/v1/flows/?name={name}")
+    if isinstance(flows, list):
+        found = next((f for f in flows if f.get("name") == FALLBACK_FLOW_NAME), None)
+        if found:
+            return found
+    return None
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Buat/update flow Langflow BriefME")
+    parser.add_argument("--engine", choices=("bob", "gemini"),
+                        default=os.environ.get("ENGINE", "bob"),
+                        help="bob = arsitektur utama (default); gemini = flow cadangan")
+    args = parser.parse_args()
+    engine = args.engine
+
     load_env_file(BASE / ".env")
     if not os.environ.get("LANGFLOW_API_KEY"):
         sys.exit("Set LANGFLOW_API_KEY dulu (lihat .env)")
 
-    gemini_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not gemini_key:
-        sys.exit(f"Set {GEMINI_VAR_NAME} dulu di .env (kunci Gemini untuk node Agent)")
-
-    sync_gemini_variable(gemini_key)
+    # MCP server tool dokumen — dipakai engine gemini (node MCP Tools) dan oleh
+    # clone fallback; idempoten sehingga aman dipanggil di kedua engine.
     register_mcp_server()
 
-    data = build_flow()
-    existing = find_existing_flow()
+    if engine == "bob":
+        if not os.environ.get("BOB_API_KEY"):
+            sys.exit("Set BOB_API_KEY dulu di .env (kunci API resmi Bob)")
 
-    if existing:
-        flow_id = existing["id"]
+        # Migrasi: simpan flow Gemini yang masih menempati primary sebagai
+        # fallback SEBELUM data primary ditimpa dengan data bob.
+        existing = find_existing_flow()
+        if existing and is_gemini_style(existing) and not find_fallback_flow():
+            clone = api("POST", "/api/v1/flows/",
+                        {"name": FALLBACK_FLOW_NAME, "data": existing["data"],
+                         "endpoint_name": FALLBACK_ENDPOINT, "description": DESC_GEMINI})
+            (BASE / FLOW_ID_GEMINI).write_text(clone["id"])
+            print(f"Flow fallback dicloning: {FALLBACK_FLOW_NAME} id={clone['id']} "
+                  f"endpoint {FALLBACK_ENDPOINT}")
+
+        data = build_flow_bob()
+        target, name, endpoint, desc = existing, FLOW_NAME, ENDPOINT, DESC_BOB
+    else:
+        gemini_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        if not gemini_key:
+            sys.exit(f"Set {GEMINI_VAR_NAME} dulu di .env (kunci Gemini untuk node Agent)")
+        sync_gemini_variable(gemini_key)
+
+        data = build_flow_gemini()
+        target = find_fallback_flow()
+        if target is None:
+            primary = find_existing_flow()
+            if primary and is_gemini_style(primary):
+                target, name, endpoint, desc = primary, FLOW_NAME, ENDPOINT, DESC_GEMINI
+            else:
+                target = None
+        if target is None:
+            name, endpoint, desc = FALLBACK_FLOW_NAME, FALLBACK_ENDPOINT, DESC_GEMINI
+
+    if target:
+        flow_id = target["id"]
         api("PATCH", f"/api/v1/flows/{flow_id}",
-            {"name": FLOW_NAME, "data": data, "endpoint_name": ENDPOINT,
-             "description": "BriefME — Thought Record CBT dari jurnal pasien "
-                            "(Langflow Agent + Gemini + MCP hearmeout-tools)"})
-        print(f"Flow UPDATED: {FLOW_NAME} id={flow_id}")
+            {"name": name, "data": data, "endpoint_name": endpoint, "description": desc})
+        print(f"Flow UPDATED [{engine}]: {name} id={flow_id}")
     else:
         res = api("POST", "/api/v1/flows/",
-                  {"name": FLOW_NAME, "data": data, "endpoint_name": ENDPOINT,
-                   "description": "BriefME — Thought Record CBT dari jurnal pasien "
-                                  "(Langflow Agent + Gemini + MCP hearmeout-tools)"})
+                  {"name": name, "data": data, "endpoint_name": endpoint, "description": desc})
         flow_id = res.get("id")
-        print(f"Flow CREATED: {FLOW_NAME} id={flow_id}")
+        print(f"Flow CREATED [{engine}]: {name} id={flow_id}")
 
-    (BASE / ".flow_id").write_text(flow_id)
-    print(f"endpoint: {lf_url()}/api/v1/run/{ENDPOINT}")
-    print(f"flow id disimpan di {BASE}/.flow_id")
+    if engine == "gemini":
+        (BASE / FLOW_ID_GEMINI).write_text(flow_id)
+    else:
+        (BASE / ".flow_id").write_text(flow_id)
+    print(f"engine: {engine}  endpoint: {lf_url()}/api/v1/run/{endpoint}")
+    print(f"flow id disimpan di {BASE / ('.flow_id.gemini' if engine == 'gemini' else '.flow_id')}")
 
 
 if __name__ == "__main__":

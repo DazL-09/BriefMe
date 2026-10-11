@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "hearmeout-tools": {
+      "url": "http://127.0.0.1:8788/mcp",
+      "timeout": 60000,
+      "alwaysAllow": ["generate_clinical_document"]
+    }
+  }
+}

@@ -1,109 +1,84 @@
-# AI Agent Implementation Plan (HearMeOut)
+# AI Agent Implementation Plan (HearMeOut / BriefME)
 **Dokumen:** `Agent-Plan.md`
-**Fokus:** Eksekusi Lokal (Langflow native) & tool MCP lokal — tanpa dependensi cloud agent eksternal.
+**Arsitektur final (11 Okt 2026):** **IBM Bob (engine, API key resmi) + Langflow (orkestrasi) dengan MCP di sisi Bob** — domain tetap BriefME. Flow Gemini 5 node hanya cadangan.
 
 ## 1. Arsitektur Komponen
-1. **Flow Langflow (BriefME):** Menerima teks jurnal pasien (tanpa data pribadi — keputusan 9 Okt, tahap sensor lokal dibuang) dan menggerakkan ekstraksi CBT via node **Agent** (Gemini) dengan tool calling ke MCP.
-2. **Cognitive Brain (Agent Gemini di dalam Langflow):** Menerima teks jurnal, melakukan ekstraksi matriks CBT, dan menentukan pemanggilan alat (*tool calling*) — model lewat node **GoogleGenerativeAI**, tool lewat **MCPTools**.
-3. **Execution Tool (MCP Server):** Server lokal berbasis Python yang mengekspos fungsi pembuatan file `.docx` untuk dipanggil oleh Agent.
+
+1. **Flow Langflow "BriefME" (utama):** `POST /api/v1/run/briefme` menerima teks jurnal pasien (tanpa data pribadi) dan menggerakkan rantai **Chat Input → Prompt → Python Interpreter → Parse JSON → Parser → Chat Output "Thought Record"** (6 node / 5 edge).
+2. **Cognitive Brain = IBM Bob:** node **Python Interpreter** menjalankan `bob run --mode agent --format json` (kunci `BOB_API_KEY`, `--workspace` root proyek). Prompt CBT (`AGENT_SYSTEM_PROMPT`) dirender node **Prompt** lewat str.format `{text}`. Bob memanggil tool **MCP `hearmeout-tools`** lewat `.bob/mcp.json` (`url: http://127.0.0.1:8788/mcp`) → dokumen `.docx` dibuat oleh Bob sendiri.
+3. **Pasca-proses native Langflow:** output bob (`stdout` JSON) → node **Parse JSON** (jq: ekstrak `last_message`, bersihkan fence) → node **Parser** (`pattern={text}`, satu baris per data) → **Chat Output "Thought Record"** (tabel Markdown + baris `Dokumen: <path>`).
+4. **Execution Tool (MCP Server):** `mcp_server.py` (Python, fastmcp, docxtpl) mengekspos `generate_clinical_document` → render `template_cbt.docx` → `output/brief_<id>.docx` + `audit.jsonl`.
+5. **Flow cadangan "BriefME (Gemini)"** (`briefme-gemini`): arsitektur lama 5 node — Chat Input → Agent (+GoogleGenerativeAI + MCPTools) → Chat Output. Dibuat/di-clone otomatis oleh builder; dipakai bila engine Bob bermasalah (perlu `GOOGLE_API_KEY` asli).
+
+```
+Payload uji → POST /api/v1/run/briefme
+┌─ Langflow :7860 — flow "BriefME": 6 node / 5 edge ───────────────────────────┐
+│ Chat Input → Prompt(kode CBT + {text}) → Python Interpreter → Parse JSON →   │
+│ Parser({text}) → Chat Output "Thought Record"                                │
+└───────────────────────────────────┬──────────────────────────────────────────┘
+        Python Interpreter: bob run --mode agent --format json
+        (.bob/mcp.json → hearmeout-tools, kunci BOB_API_KEY)
+                                    ▼
+┌─ MCP Server HearMeOut_Tools :8788 (mcp_server.py) ───────────────────────────┐
+│ docxtpl → template_cbt.docx → output/brief_<id>.docx (+ audit.jsonl)         │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 2. Tahap 1: Konfigurasi Flow Langflow (BriefME)
-*   **Node Setup (5 node / 4 edge):** `Chat Input` $\rightarrow$ `Agent` (prompt CBT `AGENT_SYSTEM_PROMPT`; input `model` dari node `GoogleGenerativeAI` gemini-2.5-flash `tool_model_enabled=true`, input `tools` dari node `MCPTools` server `hearmeout-tools`) $\rightarrow$ `Chat Output "Thought Record"`.
-*   **Endpoint:** `POST /api/v1/run/briefme` (`output_type=chat`).
-*   ~~Tahap sensor Ollama/anonymizer (Prompt `[DISENSOR]` + model `qwen2.5:3b`)~~ — **dibuang 9 Okt**: input jurnal dianggap tanpa data pribadi.
-*   ~~Python Interpreter (`bob run`) + Parse JSON/Parser~~ — **dibuang 11 Okt**: Bob CLI di-uninstall, arsitektur pindah ke Agent native.
+
+*   **Node Setup (6 node / 5 edge):** `Chat Input` → `Prompt Template` (template = kode python, variabel dinamis `text`) → `Python Interpreter` (`global_imports=math,os,subprocess`; kode `bob run`, timeout 900s) → `Parse JSON` (query jq `last_message`) → `Parser` (`pattern={text}`) → `Chat Output "Thought Record"`.
+*   **Endpoint:** `POST /api/v1/run/briefme` (`output_type=chat`); cadangan `briefme-gemini`.
+*   **Builder ganda:** `python scripts/create_langflow_flow.py [--engine bob|gemini]` (default `bob`); migrasi meng-clone flow Gemini ke "BriefME (Gemini)" sebelum primary ditimpa data bob.
+*   **Sandbox Python Interpreter:** kode tanpa pernyataan `import` (ditolak `validate_code_safety`) — module dari `global_imports`; tanpa `open()` — fallback kunci dibaca via `subprocess cat .env`.
+*   ~~Tahap sensor Ollama/anonymizer~~ — **dibuang 9 Okt**; ~~arsitektur Agent Gemini murni~~ — **diganti 11 Okt** (Bob via API resmi kembali jadi engine; lihat `AGENT_LOG.md` bag.17–18).
 
 ---
 
-## 3. Tahap 2: Cognitive Brain — Agent Gemini (node Langflow)
-*   **Role:** Clinical Journaling Copilot.
-*   **Koneksi Alat:** Server MCP `hearmeout-tools` (`http://127.0.0.1:8788/mcp`) terdaftar di Langflow (API v2) dan dirujuk node `MCPTools` — Agent menerima tool `generate_clinical_document`.
-*   **Kunci API:** variabel global Langflow `GOOGLE_API_KEY` (disinkron builder dari `.env`, `load_from_db=true`, divalidasi live ke Google saat disimpan).
-*   **System Prompt:** embedded di builder sebagai `AGENT_SYSTEM_PROMPT` (sumber historis: `bob_agent/system_prompt.txt` / `.bob/custom_modes.yaml` — berkas dihapus saat cleanup):
-    ```text
-    Anda adalah Clinical Copilot dari HearMeOut. Anda menerima teks jurnal pasien
-    (tanpa data pribadi) dan tugas Anda mengekstraknya ke matriks CBT lalu membuat
-    dokumen lewat tool yang tersedia.
+## 3. Tahap 2: Cognitive Brain — IBM Bob (via API resmi)
 
-    Langkah wajib Anda:
-    1. Analisis teks dan ekstrak ke dalam format JSON dengan kunci:
-       - situation (Situasi/kejadian pemicu)
-       - thought (Pikiran otomatis yang muncul saat kejadian)
-       - emotion (Emosi yang dirasakan)
-       - behavior (Perilaku yang dilakukan)
-       - alternate_thought (Pikiran alternatif yang lebih seimbang — hasil
-         restrukturisasi kognitif ringan, bukan kutipan dari teks)
-    2. Setelah ekstraksi selesai, panggil tool 'generate_clinical_document'
-       dengan mengirimkan data JSON tersebut (tepat satu kali per teks masuk).
-    3. Setelah tool sukses, akhiri pesan HANYA dengan format berikut (tanpa teks lain):
-       | Situasi | Pikiran | Emosi | Perilaku | Pikiran Alternatif |
-       |---|---|---|---|---|
-       | ... | ... | ... | ... | ... |
-       (satu baris data per situasi; bila teks memuat beberapa situasi, buat beberapa baris)
-
-       Lalu satu baris kosong dan satu baris: Dokumen: <path file dokumen>
-
-    Aturan:
-    - Jangan berikan saran medis kepada pengguna. Fokus pada ekstraksi data secara objektif.
-    - Asumsikan teks jurnal tidak memuat data pribadi; jangan bertanya mengenai identitas pasien.
-    - Ekstraksi harus objektif: kutip/parafrase keluhan apa adanya, tanpa diagnosa.
-    - Bila panggilan tool gagal, ulangi tepat satu kali, lalu laporkan error apa adanya —
-      jangan pernah menjawab "timeout" atau "server tidak tersedia" tanpa mencoba tool.
-    - Bila teks tidak memuat keluhan yang bisa diekstrak, tetap buat tabel dengan sel "-".
-    ```
+*   **Role:** Clinical Journaling Copilot (`AGENT_SYSTEM_PROMPT`, teks sama dengan yang dipakai fallback Gemini — tanpa jargon CLI, tanpa kurawal).
+*   **Runtime:** `bob run --accept-license --mode agent --format json --log-level error --trust --workspace <project> --max-turns <BOB_MAX_TURNS> --disable-subagents <prompt>` (stdin ditutup; `bobshell` 2.0.6 dari npm, tanpa shim).
+*   **Koneksi alat:** `.bob/mcp.json` → `{"mcpServers": {"hearmeout-tools": {"url": "http://127.0.0.1:8788/mcp", "timeout": 60000, "alwaysAllow": ["generate_clinical_document"]}}}` — MCP **di sisi Bob**, bukan lewat node Langflow.
+*   **Kunci API:** `BOB_API_KEY` di `.env` (juga dibaca runtime node dari `.env` via `cat` bila env proses Langflow kosong); `BOB_MAX_TURNS` default `6`.
+*   **System Prompt (ringkas):** ekstraksi jurnal ke JSON 5 kunci (situation/thought/emotion/behavior/alternate_thought) → panggil `generate_clinical_document` tepat satu kali → akhiri dengan tabel Markdown 5 kolom + baris `Dokumen: <path>`; larangan saran medis/diagnosa; gagal tool = ulangi sekali lalu laporkan. Teks lengkap: `AGENT_SYSTEM_PROMPT` di `scripts/create_langflow_flow.py`.
 
 ---
 
 ## 4. Tahap 3: Pembuatan MCP Server (Tool Execution)
+
 *   **Stack:** Python, `fastmcp`, `docxtpl`.
-*   **Persiapan Template:** `template_cbt.docx` = tabel Thought Record 5 kolom
-    (header Indonesia: Situasi, Pikiran, Emosi, Perilaku, Pikiran Alternatif) dengan
-    tag Jinja2 `{{ situation }}`, `{{ thought }}`, `{{ emotion }}`, `{{ behavior }}`,
-    `{{ alternate_thought }}` — dibuat oleh `make_template.py`.
-*   **Skrip `mcp_server.py`:** melihat berkas `mcp_server.py` di root proyek (tool `generate_clinical_document` → render `template_cbt.docx` → simpan ke `output/brief_<id>.docx`).
+*   **Persiapan Template:** `template_cbt.docx` = tabel Thought Record 5 kolom (header Indonesia: Situasi, Pikiran, Emosi, Perilaku, Pikiran Alternatif) dengan tag Jinja2 `{{ situation }}`, `{{ thought }}`, `{{ emotion }}`, `{{ behavior }}`, `{{ alternate_thought }}` — dibuat oleh `make_template.py`.
+*   **Skrip `mcp_server.py`:** tool `generate_clinical_document` → render `template_cbt.docx` → simpan ke `output/brief_<id>.docx` (+ jejak `audit.jsonl`). Dipanggil **oleh Bob** (bukan oleh node Langflow).
 
 ---
 
 ## 5. Tahap 4: Alur Pengujian Terintegrasi (End-to-End)
-1.  **Preflight:** `scripts/run_e2e.py` menolak berjalan bila `GOOGLE_API_KEY` masih placeholder (`xxx`) / kosong, atau `LANGFLOW_API_KEY` tidak ada.
-2.  **Jalankan MCP Server:** Eksekusi `python mcp_server.py` di terminal agar alat *generate docx* aktif (*listening*).
-3.  **Inisialisasi Langflow:** Pastikan Langflow siap menerima input (Ollama/Bob tidak lagi dipakai alur ini).
-4.  **Kirim Payload Uji:** Satu POST ke `POST /api/v1/run/briefme` dengan teks jurnal tanpa data pribadi.
-5.  **Verifikasi Output:** Respons SATU output **Thought Record** (tabel Markdown + baris `Dokumen: <path>`); guard regex PII + `INSTRUCTION_FRAGMENTS` (kebocoran prompt).
-6.  **Cek Output Fisik:** Buka direktori `output/` untuk memverifikasi file `.docx` berhasil terbuat dan variabel *template* terisi dengan data analisis CBT yang tepat.
+
+1.  **Preflight (`E2E_ENGINE=bob|gemini`, default bob):** bob → `BOB_API_KEY` terisi, `.bob/mcp.json` ada, `bob --version` sehat (2.0.6); gemini → `GOOGLE_API_KEY` bukan placeholder; `LANGFLOW_API_KEY` wajib.
+2.  **Health:** Langflow `/health` + MCP `generate_clinical_document` terdaftar + `bob --version`.
+3.  **Kirim payload uji:** satu POST ke endpoint sesuai engine dengan teks jurnal tanpa data pribadi.
+4.  **Verifikasi output:** SATU output **Thought Record** (tabel Markdown header Indonesia + baris `Dokumen: <path>`); guard regex PII + `INSTRUCTION_FRAGMENTS` (kebocoran prompt) + bukan dump JSON mentah.
+5.  **Cek output fisik:** `output/brief_*.docx` — tabel 5 kolom terisi, sel "Pikiran Alternatif" bukan placeholder, konten selaras input, bebas PII.
 
 ---
 
-## Lampiran — Status Implementasi (diperbarui 11 Okt 2026)
+## Lampiran — Status Implementasi (11 Okt 2026)
 
 | Tahap | Status | Berkas |
 |---|---|---|
-| Tahap 1 — Flow Langflow | ✅ flow **5 node / 4 edge** `BriefME` (endpoint `briefme`, id `fb741b8a-c2c0-4d41-9b75-df9294732ab5`) — rename via PATCH dari flow sensor lama; otak = node **Agent** + **GoogleGenerativeAI** + **MCPTools** (tanpa Python Interpreter/Parse JSON/Parser) | `scripts/create_langflow_flow.py`, `.flow_id` |
-| Tahap 2 — Agent Gemini | ✅ prompt CBT embedded (`AGENT_SYSTEM_PROMPT`); variabel `GOOGLE_API_KEY` sinkron dari `.env` (DELETE+POST, validasi live); server MCP `hearmeout-tools` terdaftar via API v2 | `scripts/create_langflow_flow.py`, `.env` |
+| Tahap 1 — Flow Langflow | ✅ flow **6 node / 5 edge** `BriefME` (endpoint `briefme`, id `fb741b8a-…`) + fallback **5 node / 4 edge** `BriefME (Gemini)` (endpoint `briefme-gemini`, id `fcddb060-…`); builder `--engine bob\|gemini` + migrasi clone | `scripts/create_langflow_flow.py`, `.flow_id`, `.flow_id.gemini` |
+| Tahap 2 — Cognitive Brain Bob | ✅ `bob run --mode agent` dari node Python Interpreter; MCP sisi Bob via `.bob/mcp.json` (kunci `url`); uji tool penuh → `brief_446d6a46.docx` | `.bob/mcp.json`, `.env` (`BOB_API_KEY`, `BOB_MAX_TURNS`) |
 | Tahap 3 — MCP Server | ✅ tool live di `http://127.0.0.1:8788/mcp` | `mcp_server.py`, `template_cbt.docx`, `make_template.py` |
-| Tahap 4 — E2E test | ✅ 19 cek per run; preflight kunci Gemini gagal cepat sebelum menyentuh layanan (belum ada run penuh pasca-refactor sampai kunci asli diisi) | `scripts/run_e2e.py` |
-| Tahap 5 — Web UI | ✅ scaffold React + Vite + TS: input jurnal → proxy `/api/*` (API key disuntik server) → render tabel **Thought Record** + path dokumen (endpoint `briefme`); copy bar: "jurnal → Agent CBT → Thought Record + dokumen"; **styling motion** per Design MD (Create mode, Primary Emil · Secondary Jakub, framer-motion, reduced-motion) — `npm run build` lolos | `web/` |
+| Tahap 4 — E2E test | ✅ **semua pemeriksaan LOLOS 19.9s** (engine bob: preflight BOB key + `bob --version`, run 13.5s, docx 5 kolom, bebas PII/prompt leak) | `scripts/run_e2e.py` |
+| Tahap 5 — Web UI | ✅ React + Vite + TS: jurnal → **Bob Agent** → Thought Record; footer transparansi AI; `npm run build` lolos | `web/` |
 
 **Penyimpangan dari rencana (keputusan eksplisit):**
 
-* **Tahap sensor lokal DIBUANG (9 Okt).** Prompt anonymizer, node Ollama, output
-  `Sensor Output`, `brain_server.py`, `models/`, dan env `OLLAMA_*`/`SENSOR_*`/
-  `BRAIN_*`/`WATSONX_*`/`BOB_MODEL` dihapus dari project; model Ollama dihapus
-  dari mesin (software Ollama dibiarkan terpasang). Alasan: jurnal pasien tidak
-  memuat data pribadi — riwayat iterasi sensor di `AGENT_LOG.md` bag.3–8.
-* ~~Arsitektur A (Python Interpreter `bob run`)~~ — **diganti 11 Okt**: Bob CLI
-  (`bobshell`) di-uninstall dari mesin (npm + unit systemd
-  `bob-gateway-shim.service` dihapus); pipeline kini Agent Gemini native +
-  MCPTools. Alasan: Bob hanya bisa dijalankan lewat CLI Python-nya sendiri,
-  tidak bisa menjadi server MCP — lihat `AGENT_LOG.md` bag.17.
-* Output flow kini SATU `Chat Output` (**"Thought Record"**), dipanggil lewat
-  `POST /api/v1/run/briefme` (`output_type=chat`) — komponen `Webhook`
-  Langflow bersifat input, bukan output.
-* ~~Shim gateway `bob_gateway_shim.py`~~ — **dihapus 11 Okt** bersama Bob CLI.
-* Fase A (clock CPU 1,4 → 2,1 GHz) menaikkan sensor 0,95 → 2,12 tok/s —
-  `AGENT_LOG.md` bag.10.
+* **Tahap sensor lokal DIBUANG (9 Okt)** — jurnal dianggap tanpa data pribadi; PII jadi guard regex (`AGENT_LOG.md` bag.3–8).
+* **Arsitektur murni Gemini sempat jadi utama (11 Okt, bag.17)** — lalu **dikembalikan ke Bob via API resmi** sesuai kriteria hackathon (Bob + Langflow, MCP di sisi Bob); Gemini dipertahankan sebagai flow cadangan (`AGENT_LOG.md` bag.18).
+* **Bob gateway shim pernah dipasang lalu dihapus** — jalur resmi kini API key (`bob run` tanpa shim); `bobshell` 2.0.6 terpasang via npm.
+* **Akun model:** engine bob tidak butuh `GOOGLE_API_KEY`; kunci Gemini hanya untuk flow cadangan.
 
-Lihat `README.md` untuk urutan menjalankan seluruh komponen, `AGENT_LOG.md` untuk
-angka ukur dan riwayat diagnosis.
+Lihat `README.md` untuk urutan menjalankan seluruh komponen, `AGENT_LOG.md` untuk angka ukur dan riwayat diagnosis.

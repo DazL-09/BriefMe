@@ -108,7 +108,7 @@ export default function App() {
       <main className="page">
         <header className="hero">
           <h1>HearMeOut</h1>
-          <p>Clinical Journaling Copilot — jurnal → Agent CBT → Thought Record + dokumen</p>
+          <p>Clinical Journaling Copilot — jurnal → Bob Agent → Thought Record + dokumen</p>
         </header>
 
         <section className="card">
@@ -136,7 +136,7 @@ export default function App() {
                   exit={{ opacity: 0 }}
                   transition={{ duration: 0.15 }}
                 >
-                  ± 1 menit (AI + dokumen)
+                  ± 1 menit (Bob + dokumen)
                 </motion.span>
               )}
             </AnimatePresence>
@@ -197,6 +197,11 @@ export default function App() {
             </motion.section>
           )}
         </AnimatePresence>
+
+        <footer className="muted footer-note">
+          Dibuat dengan bantuan AI (IBM Bob + Langflow). Keluaran adalah ekstraksi
+          otomatis dari jurnal Anda — bukan diagnosis atau saran medis.
+        </footer>
       </main>
     </MotionConfig>
   )

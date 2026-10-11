@@ -447,3 +447,63 @@ cleanup = agresif; Bob = uninstall penuh.
 * **Status akhir sesi:** builder hijau dari shell bersih (warning placeholder);
   e2e preflight gagal cepat sesuai desain; **run penuh menunggu kunci Gemini
   asli** → isi `.env` → jalankan builder (sinkron variabel) → `run_e2e.py`.
+
+## 18. Arsitektur final hackathon: Bob (API resmi) + Langflow, MCP di sisi Bob (11 Okt)
+
+* **Kebalian sesi:** plan hackathon (deadline Stage 1 hari ini) — engine =
+  **IBM Bob via API key resmi** + Langflow sebagai orkestrasi; **MCP dipasang di
+  sisi Bob** (`.bob/mcp.json`), bukan lewat node Langflow; domain **BriefME
+  tetap** (tanpa pivot MiMo); Gemini 5-node hanya **flow cadangan**. Bob
+  2.0.6 kembali terpasang (npm `bobshell`, tanpa shim systemd).
+* **Key & CLI:** `BOB_API_KEY` + `BOB_MAX_TURNS=6` di `.env`; `bob run` headless
+  = `--accept-license --mode ask|agent --format json --log-level … --trust
+  -w $PWD` + stdin `< /dev/null` (2.0.6 tanpa `-p`; prompt positional).
+* **MCP sisi Bob:** `.bob/mcp.json` — kunci **`url`** (bukan `httpURL`; bundle
+  `bob.js` tak punya string itu; error validator: "must include a command or
+  URL"), `timeout` milidetik, `alwaysAllow: [generate_clinical_document]`.
+  Uji penuh: `mcp__hearmeout-tools__generate_clinical_document` terpanggil →
+  `output/brief_446d6a46.docx`.
+* **Preflight sandbox Langflow (offline, sebelum menyentuh flow):**
+  * `validate_code_safety` **menolak `ast.Import`** — module wajib lewat field
+    `global_imports` (`"math,os,subprocess"`, dipisah koma); builtins sandbox
+    **tanpa `open()`** → fallback kunci BOB dibaca via `subprocess cat .env`.
+  * Prompt template = kode python str.format; audit `{`/`}` hanya `{text}`;
+    `validate_prompt` → `['text']`; field dinamis disuntik manual (bentuk
+    `DefaultPromptField.to_dict()`).
+  * jq `last_message` (fromjson + capture-noise + fence-strip) lolos
+    `validate_jq_program` + 8 kasus uji.
+  * Eksekusi nyata di globals sandbox (`import_allowed_module`) → `bob run
+    --mode agent` sukses, `tool_calls: 1`, stdout JSON.
+  * Mini-flow API membuktikan **gate `allow_custom_components` terbuka** dan
+    edge `→python_code` menimpa nilai template saat runtime (persis perilaku
+    yang dibutuhkan rantai Prompt→Python).
+* **Builder `create_langflow_flow.py` — `--engine bob|gemini` (default bob):**
+  * `build_flow_bob()`: **6 node / 5 edge** — ChatInput→Prompt.text→
+    PythonREPL.python_code→ParseJSON.input_value→Parser.input_data→
+    ChatOutput; `global_imports=math,os,subprocess`; query jq `JQ_LAST_MESSAGE`;
+    Parser `pattern={text}`; ChatOutput "Thought Record". Node id `…-HEARB1..6`.
+  * Kode python node: absolut `~/.local/share/npm/bin/bob` (PATH Langflow tak
+    memuatnya), `subprocess.run([bob,'run',…,prompt], input='', timeout=900,
+    env=env, cwd=PROJECT)`, fallback baca `.env` via `cat`, instruksi =
+    `AGENT_SYSTEM_PROMPT` (sama, tanpa kurawal).
+  * Migrasi: flow Gemini yang menempati primary **di-clone** ke "BriefME
+    (Gemini)" endpoint `briefme-gemini` (`.flow_id.gemini`) sebelum primary
+    ditimpa data bob. `--engine gemini` = sinkron `GOOGLE_API_KEY` + update
+    flow cadangan.
+* **Bug predicate:** `"GoogleGenAI" in json.dumps(data)` **selalu False** —
+  substring itu tidak ada di `"GoogleGenerativeAIComponent"` (huruf `e` di
+  tengah) → klone tak terpicu, data Gemini primary hilang. Diperbaiki ke
+  `"GoogleGenerativeAI"`; fallback diregenerasi dari `build_flow_gemini()`
+  (id `fcddb060-2eef-45c8-bb20-8cbd385f317d`).
+* **Insiden autosave UI (terulang):** smoke test sukses 05:48 (12.7s, tabel +
+  `brief_aa09b8ee.docx`) → **05:49:54 flow ditimpa tab editor Langflow** jadi
+  4 node tanpa model → run berikutnya `500 "No model selected"`. Rebuild +
+  e2e langsung hijau. **Selalu tutup tab editor flow sebelum/sesudah builder.**
+* **E2E engine-aware:** `E2E_ENGINE=bob|gemini` — preflight bob: `BOB_API_KEY`
+  terisi + `.bob/mcp.json` ada + health `bob --version` (2.0.6); gemini:
+  `GOOGLE_API_KEY` bukan placeholder; endpoint `briefme` vs `briefme-gemini`;
+  label rantai disesuaikan. **Hasil: semua pemeriksaan LOLOS dalam 19.9s**
+  (output tabel 5 kolom + `brief_3cb6d30f.docx`, bebas PII & kebocoran prompt).
+* **Web:** hero "jurnal → Bob Agent → Thought Record + dokumen"; hint
+  "(Bob + dokumen)"; footer transparansi AI (bantuan AI — bukan diagnosis);
+  `npm run build` lolos.

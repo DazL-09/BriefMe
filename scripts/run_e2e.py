@@ -1,24 +1,24 @@
-"""Tahap 4 — Pengujian terintegrasi (end-to-end) BriefME — Arsitektur native Langflow.
+"""Pengujian terintegrasi (end-to-end) BriefME — dua engine (E2E_ENGINE=bob|gemini).
 
-Alur yang diuji:
-  1. Preflight: GOOGLE_API_KEY harus kunci asli (bukan placeholder) + layanan sehat
+Alur yang diuji (engine bob — default, arsitektur utama):
+  1. Preflight: BOB_API_KEY terisi + bob CLI sehat (bob --version) + layanan sehat
      (Langflow, MCP Server hearmeout-tools)
   2. Satu POST ke API Langflow:
      POST /api/v1/run/briefme                              (endpoint: briefme)
-     respons SATU output: "Thought Record" (tabel MD + baris Dokumen)
-  3. Verifikasi output flow (plan: langkah 5, kini di dalam flow):
-     Agent (Gemini, prompt CBT) -> tool MCP generate_clinical_document;
-     output = tabel Markdown dengan header Indonesia + baris
-     "Dokumen: <path>"; guard regex PII
+     rantai: Prompt (kode CBT) -> Python Interpreter (bob run --mode agent)
+             -> jq (last_message) -> Parser -> "Thought Record"
+     Bob memanggil tool MCP generate_clinical_document lewat .bob/mcp.json
+  3. Verifikasi output: tabel Markdown header Indonesia + baris "Dokumen: <path>",
+     guard regex PII + guard kebocoran instruksi prompt
   4. Cek output fisik .docx: tabel 5 kolom terisi, guard regex PII
-                                                          (plan: langkah 6)
 
-Catatan: tahap sensor/Ollama/Bob CLI dibuang (keputusan refactor) — teks input
-bukan lagi berisi PII, jadi verifikasi PII jadi guard regex (output tidak boleh
-memuat pola HP/email/alamat yang tidak pernah dikirim).
+Engine gemini (E2E_ENGINE=gemini — flow cadangan "BriefME (Gemini)"):
+  preflight GOOGLE_API_KEY kunci asli; endpoint briefme-gemini; rantai
+  Agent (Gemini) -> node MCP Tools -> output yang sama diverifikasi.
 
 Pemakaian:
-    .venv/bin/python scripts/run_e2e.py
+    .venv/bin/python scripts/run_e2e.py                       # engine bob
+    E2E_ENGINE=gemini .venv/bin/python scripts/run_e2e.py     # flow cadangan
     (kunci dari .env — skrip memuatnya sendiri)
 """
 
@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -52,11 +54,25 @@ def _load_env_file(path: Path) -> None:
 
 _load_env_file(BASE / ".env")
 
+ENGINE = os.environ.get("E2E_ENGINE", "bob")
+if ENGINE not in ("bob", "gemini"):
+    sys.exit(f"E2E_ENGINE tidak dikenal: {ENGINE!r} (pakai bob|gemini)")
+
 LF_URL = os.environ.get("LANGFLOW_URL", "http://127.0.0.1:7860").rstrip("/")
 LF_KEY = os.environ.get("LANGFLOW_API_KEY", "")
-LF_ENDPOINT = os.environ.get("LANGFLOW_FLOW_ENDPOINT", "briefme")
+if ENGINE == "gemini":
+    LF_ENDPOINT = os.environ.get("LANGFLOW_FLOW_ENDPOINT_GEMINI", "briefme-gemini")
+else:
+    LF_ENDPOINT = os.environ.get("LANGFLOW_FLOW_ENDPOINT", "briefme")
 MCP_URL = os.environ.get("MCP_URL", "http://127.0.0.1:8788/mcp")
 GEMINI_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
+BOB_KEY = os.environ.get("BOB_API_KEY", "").strip()
+
+# Deskripsi rantai per engine untuk cetak langkah (label yang diuji tetap sama).
+CHAIN_DESC = {
+    "bob": "Prompt -> Python (bob run --mode agent) -> jq/Parser -> MCP Bob",
+    "gemini": "Agent (Gemini) -> node MCP Tools",
+}
 
 # Jurnal pasien realistis TANPA data pribadi (input flow memang dianggap bersih).
 TEST_TEXT = (
@@ -150,7 +166,7 @@ def item_text(item: dict) -> str:
 def step1_health() -> None:
     print("\n[1] Health check komponen")
     check("Langflow hidup", get(f"{LF_URL}/health").get("status") == "ok")
-    # MCP: lewat client fastmcp
+    # MCP: lewat client fastmcp (dipakai Bob via .bob/mcp.json ATAU node MCP Tools)
     import asyncio
 
     from fastmcp import Client
@@ -162,10 +178,20 @@ def step1_health() -> None:
     names = asyncio.run(tools())
     check("Tool MCP generate_clinical_document terdaftar",
           "generate_clinical_document" in names, ", ".join(names))
+    if ENGINE == "bob":
+        bob = shutil.which("bob") or str(Path.home() / ".local/share/npm/bin/bob")
+        try:
+            out = subprocess.run([bob, "--version"], capture_output=True,
+                                 text=True, timeout=30)
+            ver = (out.stdout or out.stderr).strip().splitlines()[:1]
+            check("bob CLI sehat (bob --version)", out.returncode == 0,
+                  ver[0] if ver else "")
+        except Exception as exc:  # noqa: BLE001 — laporkan apa adanya
+            check("bob CLI sehat (bob --version)", False, str(exc))
 
 
 def step2_run_flow() -> tuple[str, dict]:
-    print("\n[2] Satu POST ke Langflow: jurnal pasien -> Agent (Gemini) -> MCP")
+    print(f"\n[2] Satu POST ke Langflow: jurnal pasien -> {CHAIN_DESC[ENGINE]}")
     t0 = time.time()
     res = post(
         f"{LF_URL}/api/v1/run/{LF_ENDPOINT}",
@@ -197,7 +223,8 @@ def _strip_fence(text: str) -> str:
 
 def step3_verify_output(output_text: str) -> str:
     """Kembalikan path .docx dari output node Thought Record (tabel MD + baris Dokumen)."""
-    print("\n[3] Verifikasi output Thought Record (Agent Gemini + tool MCP)")
+    pelaku = "Bob (via MCP .bob/mcp.json)" if ENGINE == "bob" else "Agent Gemini + tool MCP"
+    print(f"\n[3] Verifikasi output Thought Record ({pelaku})")
     result_str = _strip_fence(output_text)
     missing_headers = [h for h in TABLE_HEADERS if h not in result_str]
     check("Output = tabel Markdown dgn header Indonesia",
@@ -273,13 +300,25 @@ def step4_output_file(doc_path: str) -> None:
 def preflight() -> bool:
     """Gagal cepat sebelum menyentuh layanan bila prasyarat tidak terpenuhi."""
     ok = True
+    print(f"engine: {ENGINE}  endpoint: {LF_ENDPOINT}")
     if not LF_KEY:
         print("[FAIL] LANGFLOW_API_KEY kosong — cek .env")
         ok = False
-    if not GEMINI_KEY or GEMINI_KEY == "xxx":
-        print("[FAIL] GOOGLE_API_KEY belum diisi kunci asli di .env — flow butuh "
-              "Gemini; isi kuncinya lalu jalankan scripts/create_langflow_flow.py ulang")
-        ok = False
+    if ENGINE == "bob":
+        if not BOB_KEY or len(BOB_KEY) < 20:
+            print("[FAIL] BOB_API_KEY kosong/pendek di .env — isi kunci API resmi Bob "
+                  "lalu jalankan ulang")
+            ok = False
+        if not (BASE / ".bob" / "mcp.json").exists():
+            print("[FAIL] .bob/mcp.json tidak ada — Bob tak bisa memanggil tool MCP "
+                  "(jalankan builder/pastikan workspace .bob terbentuk)")
+            ok = False
+    else:
+        if not GEMINI_KEY or GEMINI_KEY == "xxx":
+            print("[FAIL] GOOGLE_API_KEY belum diisi kunci asli di .env — flow cadangan "
+                  "butuh Gemini; isi kuncinya lalu jalankan "
+                  "scripts/create_langflow_flow.py --engine gemini ulang")
+            ok = False
     return ok
 
 
