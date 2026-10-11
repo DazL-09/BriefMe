@@ -128,15 +128,6 @@ Memastikan TypeScript dan bundling Vite bebas dari error:
 cd web && npm run build
 ```
 
-### Pengujian E2E Browser (Playwright)
-Menguji alur end-to-end lengkap (validasi input G1, ekstraksi CBT F1, saran AI F3, validasi G3/G4, download `.docx`, dan riwayat autosave):
-```bash
-node /tmp/opencode/ui-test/flow.mjs
-```
-*Status: 32 dari 32 pemeriksaan lolos (32 PASS, 0 FAIL).*
-
----
-
 ## 📁 Struktur Direktori
 
 ```text
@@ -153,7 +144,3 @@ node /tmp/opencode/ui-test/flow.mjs
 ```
 
 ---
-
-## 📄 Lisensi
-
-Dikembangkan untuk Hackathon Healthcare & Wellbeing 2026.
