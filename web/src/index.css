@@ -1,0 +1,217 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.5;
+  /* easing kustom (Emil): bukan ease/ease-in-out bawaan CSS */
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #f6f7f9;
+}
+
+.page {
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 32px 20px 64px;
+}
+
+.hero h1 {
+  margin: 0 0 4px;
+  font-size: 28px;
+}
+
+.hero p {
+  margin: 0 0 24px;
+  color: #5b6470;
+}
+
+.card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 20px;
+  /* multi-layer shadow menggantikan border (Jakub) — transisi halus bila berubah */
+  box-shadow:
+    0px 0px 0px 1px rgba(0, 0, 0, 0.06),
+    0px 1px 2px -1px rgba(0, 0, 0, 0.06),
+    0px 2px 4px 0px rgba(0, 0, 0, 0.04);
+}
+
+.card h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+textarea {
+  width: 100%;
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid #cdd3da;
+  border-radius: 8px;
+  resize: vertical;
+  transition: border-color 150ms var(--ease-out), box-shadow 150ms var(--ease-out);
+}
+
+textarea:focus {
+  outline: none;
+  border-color: #4c8dff;
+  box-shadow: 0 0 0 3px #4c8dff44;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+button {
+  font: inherit;
+  font-weight: 600;
+  padding: 9px 18px;
+  border: none;
+  border-radius: 8px;
+  background: #1f6feb;
+  color: #fff;
+  cursor: pointer;
+  transition:
+    transform 100ms var(--ease-out),
+    background-color 150ms var(--ease-out),
+    color 150ms var(--ease-out),
+    opacity 150ms var(--ease-out);
+}
+
+button:hover:not(:disabled) {
+  background: #1a5fd0;
+}
+
+/* umpan balik tekan (Emil): scale 0.97, bukan dari scale(0) */
+button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+button.ghost {
+  background: transparent;
+  color: #1f6feb;
+  border: 1px solid #1f6feb;
+}
+
+button.ghost:hover:not(:disabled) {
+  background: #1f6feb14;
+}
+
+.hint {
+  color: #5b6470;
+  font-size: 13px;
+}
+
+.error {
+  color: #b42318;
+  background: #fef3f2;
+  border: 1px solid #fecdca;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 0;
+}
+
+.muted {
+  color: #5b6470;
+  font-size: 14px;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+th,
+td {
+  border: 1px solid #d7dce2;
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #eef1f5;
+}
+
+.raw {
+  background: #f2f4f7;
+  border-radius: 8px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+
+.doc-path code {
+  word-break: break-all;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #14171b;
+  }
+  .card {
+    background: #1b1f24;
+    /* dark mode: border hard-edge lebih terbaca daripada shadow (Jakub) */
+    border: 1px solid #2b3138;
+    box-shadow: none;
+  }
+  .hero p,
+  .muted,
+  .hint {
+    color: #9aa4b1;
+  }
+  textarea {
+    background: #14171b;
+    color: #e8eaed;
+    border-color: #3a414a;
+  }
+  .raw {
+    background: #14171b;
+  }
+  th {
+    background: #232830;
+  }
+  th,
+  td {
+    border-color: #3a414a;
+  }
+}
+
+/* prefers-reduced-motion: wajib (skill: accessibility tidak opsional) —
+   matikan transisi/animasi CSS; framer-motion ditangani MotionConfig
+   reducedMotion="user" di App.tsx. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

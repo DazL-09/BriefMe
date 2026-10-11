@@ -1,0 +1,15 @@
+# Rahasia — jangan pernah ter-commit
+.env
+
+# Artefak Python
+.venv/
+__pycache__/
+*.pyc
+
+# Artefak web
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+
+# Dokumen hasil generate (audit.jsonl tetap dilacak)
+output/*.docx
