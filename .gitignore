@@ -11,8 +11,9 @@ web/node_modules/
 web/dist/
 web/*.tsbuildinfo
 
-# Dokumen hasil generate (audit.jsonl tetap dilacak)
-output/*.docx
+# Dokumen hasil generate & temporary files
+*.docx
+*.zip
 
 # Backend MERN
 server/node_modules/

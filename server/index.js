@@ -12,19 +12,29 @@ const ALT_MIN = 5;
 const ALT_PLACEHOLDERS = ["-", "n/a", "na", "tidak ada", "tidak diketahui", "tidak disebutkan"];
 const ANALYSIS_FIELDS = ["situation", "thought", "emotion", "behavior"];
 
+const analysisSchema = new mongoose.Schema(
+  {
+    situation: { type: String, required: true, trim: true },
+    thought: { type: String, required: true, trim: true },
+    emotion: { type: String, required: true, trim: true },
+    behavior: { type: String, required: true, trim: true },
+  },
+  { _id: false },
+);
+
+const altSchema = new mongoose.Schema(
+  {
+    text: { type: String, default: "", trim: true },
+    source: { type: String, enum: ["", "manual", "ai"], default: "" },
+  },
+  { _id: false },
+);
+
 const entrySchema = new mongoose.Schema(
   {
     journal: { type: String, required: true, trim: true },
-    analysis: {
-      situation: { type: String, required: true, trim: true },
-      thought: { type: String, required: true, trim: true },
-      emotion: { type: String, required: true, trim: true },
-      behavior: { type: String, required: true, trim: true },
-    },
-    alternateThought: {
-      text: { type: String, default: "", trim: true },
-      source: { type: String, enum: ["", "manual", "ai"], default: "" },
-    },
+    analyses: { type: [analysisSchema], default: [] },
+    alternateThoughts: { type: [altSchema], default: [] },
     documentPath: { type: String, default: "", trim: true },
   },
   { timestamps: true },
@@ -39,24 +49,39 @@ function validateEntry(doc) {
   if (journal.length > JOURNAL_MAX)
     errors.push(`journal maksimal ${JOURNAL_MAX} karakter`);
 
-  for (const key of ANALYSIS_FIELDS) {
-    if (!(doc.analysis?.[key] || "").trim())
-      errors.push(`analysis.${key} wajib terisi`);
+  const analyses = doc.analyses || [];
+  if (analyses.length === 0) errors.push("analyses minimal 1 baris");
+  analyses.forEach((a, i) => {
+    for (const key of ANALYSIS_FIELDS) {
+      if (!(a?.[key] || "").trim())
+        errors.push(`analyses[${i}].${key} wajib terisi`);
+    }
+  });
+
+  const alts = doc.alternateThoughts || [];
+  if (alts.length > analyses.length)
+    errors.push("alternateThoughts tidak boleh lebih banyak dari analyses");
+  alts.forEach((alt, i) => {
+    const t = (alt?.text || "").trim();
+    const s = alt?.source || "";
+    if (t.length > 0 && t.length < ALT_MIN)
+      errors.push(`alternateThoughts[${i}] minimal ${ALT_MIN} karakter`);
+    if (t.toLowerCase() in Object.fromEntries(ALT_PLACEHOLDERS.map((p) => [p, 1])))
+      errors.push(`alternateThoughts[${i}] berupa placeholder`);
+    if (t && !["manual", "ai"].includes(s))
+      errors.push(`alternateThoughts[${i}].source harus 'manual' atau 'ai'`);
+    if (!t && s) alt.source = "";
+  });
+
+  // G4 — dokumen hanya setelah SEMUA alt terisi
+  if ((doc.documentPath || "").trim()) {
+    const allFilled = analyses.length > 0 && analyses.every((_, i) => {
+      const t = (alts[i]?.text || "").trim();
+      return t.length >= ALT_MIN && !(t.toLowerCase() in Object.fromEntries(ALT_PLACEHOLDERS.map((p) => [p, 1])));
+    });
+    if (!allFilled)
+      errors.push("documentPath hanya boleh diisi setelah semua alternateThoughts terisi");
   }
-
-  const alt = (doc.alternateThought?.text || "").trim();
-  const source = doc.alternateThought?.source || "";
-  if (alt.length > 0 && alt.length < ALT_MIN)
-    errors.push(`alternateThought minimal ${ALT_MIN} karakter`);
-  if (alt.toLowerCase() in Object.fromEntries(ALT_PLACEHOLDERS.map((p) => [p, 1])))
-    errors.push("alternateThought berupa placeholder");
-  if (alt && !["manual", "ai"].includes(source))
-    errors.push("alternateThought.source harus 'manual' atau 'ai'");
-  if (!alt && source) doc.alternateThought.source = "";
-
-  // G4 — dokumen hanya setelah alt terisi
-  if ((doc.documentPath || "").trim() && !alt)
-    errors.push("documentPath hanya boleh diisi setelah alternateThought terisi");
 
   return errors;
 }
@@ -87,16 +112,16 @@ app.post("/api/history", async (req, res, next) => {
     const b = req.body || {};
     const doc = new Entry({
       journal: String(b.journal ?? ""),
-      analysis: {
-        situation: String(b.analysis?.situation ?? ""),
-        thought: String(b.analysis?.thought ?? ""),
-        emotion: String(b.analysis?.emotion ?? ""),
-        behavior: String(b.analysis?.behavior ?? ""),
-      },
-      alternateThought: {
-        text: String(b.alternateThought?.text ?? ""),
-        source: String(b.alternateThought?.source ?? ""),
-      },
+      analyses: (Array.isArray(b.analyses) ? b.analyses : []).map((a) => ({
+        situation: String(a?.situation ?? ""),
+        thought: String(a?.thought ?? ""),
+        emotion: String(a?.emotion ?? ""),
+        behavior: String(a?.behavior ?? ""),
+      })),
+      alternateThoughts: (Array.isArray(b.alternateThoughts) ? b.alternateThoughts : []).map((a) => ({
+        text: String(a?.text ?? ""),
+        source: String(a?.source ?? ""),
+      })),
       documentPath: String(b.documentPath ?? ""),
     });
     const errors = validateEntry(doc);
@@ -108,7 +133,7 @@ app.post("/api/history", async (req, res, next) => {
   }
 });
 
-const PATCHABLE = ["journal", "analysis", "alternateThought", "documentPath"];
+const PATCHABLE = ["journal", "analyses", "alternateThoughts", "documentPath"];
 
 app.patch("/api/history/:id", async (req, res, next) => {
   try {
