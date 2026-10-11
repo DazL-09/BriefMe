@@ -1,29 +1,21 @@
-"""Buat/update flow Langflow "BriefME" — dua engine (--engine bob|gemini, default bob).
+"""Buat/update flow Langflow "BriefME" — SATU flow, dua mode input.
 
-Engine bob (utama — arsitektur hackathon: Bob + Langflow, MCP di sisi Bob):
-    TIGA flow, masing-masing 6 node / 5 edge, rantai node sama:
-        Chat Input ──→ Prompt ──→ Python Interpreter ──→ Parse JSON ──→ Parser ──→ Chat Output
-        (input)        (kode       (subprocess bob run    (jq: ambil      (format    (label per flow)
-                        + {text})   via API resmi)         last_message)   {text})
-    1. "BriefME"             (briefme)           — F1 analisis: ekstrak 4 kolom CBT,
-       kolom Pikiran Alternatif KOSONG, TANPA tool call (bob --disable-mcp).
-    2. "BriefME — Dokumen"   (briefme-dokumen)   — F2: Bob memanggil tool MCP
-       generate_clinical_document (.bob/mcp.json → :8788) dengan JSON 5 field
-       yang diberikan, balas HANYA baris "Dokumen: <path>".
-    3. "BriefME — Alternatif"(briefme-alternatif)— F3: Bob (mode ask) memberi SATU
-       saran pikiran alternatif seimbang (disarankan pasien menulis manual).
-    Kunci dari .env BOB_API_KEY; F2 memakai MCP hearmeout-tools (mcp_server.py :8788).
+Arsitektur hackathon: Bob (API key resmi) + Langflow orkestrasi. Tidak ada flow
+tambahan — dokumen .docx dibuat di browser (web) dari data tersimpan, bukan
+lewat AI/tool.
 
-Engine gemini (cadangan — arsitektur lama, MCP lewat node Langflow):
-    5 node / 4 edge: Chat Input → Agent (+Google Generative AI + MCP Tools) → Chat Output.
-    Flow ini disimpan terpisah "BriefME (Gemini)" endpoint briefme-gemini; saat pertama
-    kali engine bob dijalankan, flow Gemini yang ada di-CLONE ke sana sebelum data
-    primary (endpoint briefme) ditimpa dengan data bob. (Perilaku legacy: alt + docx
-    langsung di satu run — hanya cadangan arsitektur, UI memakai jalur bob.)
+Satu flow "BriefME" (endpoint briefme), 6 node / 5 edge:
+    Chat Input ──→ Prompt ──→ Python Interpreter ──→ Parse JSON ──→ Parser ──→ Chat Output
+    (input)        (kode       (subprocess bob run    (jq: ambil      (format    "Thought Record"
+                    + {text})   via API resmi)         last_message)   {text})
+
+Mode dibaca dari AWALAN input oleh kode node (bukan flow terpisah):
+    - jurnal polos            → PROMPT_ANALYSIS   (bob --mode agent --disable-mcp):
+      tabel CBT 4 kolom, kolom Pikiran Alternatif KOSONG (AI tidak mengisi).
+    - "MODE=ALTERNATIF\\n{json}" → PROMPT_ALTERNATE (bob --mode ask --disable-mcp):
+      SATU kalimat saran pikiran alternatif seimbang.
 
 Catatan implementasi (mengikuti lfx.graph.flow_builder.connect):
-- Node sumber tool harus "flipped" ke tool mode: template.tool_mode=True dan
-  outputs diganti output sintetis component_as_tool (method to_toolkit).
 - Edge memakai id reactflow__edge-… dan handle string dengan œ (U+0153)
   sebagai pengganti kutip — format yang dipakai kanvas & connect.py resmi.
 - Prompt template adalah KODE python (str.format, satu-satunya variabel {text});
@@ -35,13 +27,11 @@ Catatan implementasi (mengikuti lfx.graph.flow_builder.connect):
 
 Pemakaian:
     set -a; . ./.env; set +a
-    python scripts/create_langflow_flow.py                # engine bob (default)
-    python scripts/create_langflow_flow.py --engine gemini  # flow cadangan Gemini
+    python scripts/create_langflow_flow.py
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -60,87 +50,18 @@ def lf_url() -> str:
 
 FLOW_NAME = "BriefME"
 ENDPOINT = "briefme"
-# Nama flow lama (arsitektur Bob / sensor) — dipakai untuk menemukan flow yang
-# sudah ada agar di-PATCH, bukan membuat flow baru.
-LEGACY_FLOW_NAMES = ("HearMeOut Sensor Anonymizer", "BriefME")
+DESC = ("BriefME — Thought Record CBT dari jurnal pasien (1 flow multi-mode: "
+        "analisis + saran pikiran alternatif; Langflow + Bob CLI via API resmi)")
 
-# MCP server tool dokumen (Tahap 3 — mcp_server.py). Didaftarkan ke Langflow
-# lewat API v2 + disimpan sebagai fallback di node MCP Tools.
-MCP_SERVER_NAME = "hearmeout-tools"
-MCP_SERVER_URL = os.environ.get("MCP_URL", "http://127.0.0.1:8788/mcp")
-
-# Model Gemini untuk node Agent (dan field model node Google Generative AI).
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-# Field api_key node Google Generative AI memakai load_from_db=true — nilainya
-# adalah NAMA variabel global Langflow (bukan kunci literal). Builder menyinkronkan
-# nilai .env → variabel ini lewat API (dienkripsi di database Langflow).
-GEMINI_VAR_NAME = "GOOGLE_API_KEY"
-
-# ---- Engine Bob (utama) vs Gemini (cadangan) --------------------------------
-# Primary: "BriefME" endpoint briefme (data bob bila engine bob pernah jalan).
-FALLBACK_FLOW_NAME = "BriefME (Gemini)"
-FALLBACK_ENDPOINT = "briefme-gemini"
-FLOW_ID_GEMINI = ".flow_id.gemini"
-
-DESC_BOB = ("BriefME — Thought Record CBT dari jurnal pasien "
-            "(Langflow orkestrasi + Bob CLI via API resmi, MCP di sisi Bob)")
-DESC_GEMINI = ("BriefME (Gemini) — cadangan arsitektur Gemini "
-               "(Langflow Agent + MCP hearmeout-tools)")
-
-def make_ids(suffix: str) -> dict:
-    """Id node per flow — rantainya sama, beda prefix (HEARB/HEARD/HEARA)."""
-    return {
-        "chat_input": f"ChatInput-{suffix}1",
-        "prompt": f"Prompt-{suffix}2",
-        "python": f"PythonREPL-{suffix}3",
-        "parse_json": f"ParseJSONData-{suffix}4",
-        "parser": f"Parser-{suffix}5",
-        "chat_output": f"ChatOutput-{suffix}6",
-    }
-
-
-# Spesifikasi tiga flow engine bob — prompt/flag/endpoint per tahap produk.
-BOB_FLOWS = [
-    {
-        "key": "main",
-        "name": FLOW_NAME,
-        "endpoint": ENDPOINT,
-        "id_file": ".flow_id",
-        "prompt": "PROMPT_ANALYSIS",
-        "mode": "agent",
-        "disable_mcp": True,
-        "display": "Thought Record",
-        "desc": DESC_BOB,
-        "id_suffix": "HEARB",
-    },
-    {
-        "key": "dokumen",
-        "name": "BriefME — Dokumen",
-        "endpoint": "briefme-dokumen",
-        "id_file": ".flow_id.dokumen",
-        "prompt": "PROMPT_DOCUMENT",
-        "mode": "agent",
-        "disable_mcp": False,
-        "display": "Dokumen",
-        "desc": "BriefME — pembuatan dokumen .docx via tool MCP "
-                "(dipanggil setelah pikiran alternatif terisi)",
-        "id_suffix": "HEARD",
-    },
-    {
-        "key": "alternatif",
-        "name": "BriefME — Alternatif",
-        "endpoint": "briefme-alternatif",
-        "id_file": ".flow_id.alternatif",
-        "prompt": "PROMPT_ALTERNATE",
-        "mode": "ask",
-        "disable_mcp": True,
-        "display": "Saran Pikiran Alternatif",
-        "desc": "BriefME — saran pikiran alternatif AI (opsi tambahan; "
-                "pasien disarankan menulis manual)",
-        "id_suffix": "HEARA",
-    },
-]
+# Id node flow (satu-satunya flow; suffix HEARB dipertahankan dari iterasi lama).
+BOB_IDS = {
+    "chat_input": "ChatInput-HEARB1",
+    "prompt": "Prompt-HEARB2",
+    "python": "PythonREPL-HEARB3",
+    "parse_json": "ParseJSONData-HEARB4",
+    "parser": "Parser-HEARB5",
+    "chat_output": "ChatOutput-HEARB6",
+}
 
 # Ambil last_message dari output `bob run --format json` (String.data stdout),
 # tahan terhadap noise sebelum JSON dan pagar code fence; sudah lolos
@@ -153,20 +74,12 @@ JQ_LAST_MESSAGE = (
     '| if type == "string" then (gsub("```[a-z]*"; "") | ltrimstr("\\n")) else tostring end'
 )
 
-IDs = {
-    "chat_input": "ChatInput-HEAR1",
-    "gemini": "GoogleGenAI-HEAR2",
-    "mcp_tools": "MCPTools-HEAR3",
-    "agent": "Agent-HEAR4",
-    "chat_output": "ChatOutput-HEAR5",
-}
+# ---- Prompt per mode ---------------------------------------------------------
+# Semua teks TANPA kurung kurawal (audit di build_python_code_template_multi)
+# karena ikut ter-embed ke template kode python str.format {text}.
 
-# ---- Prompt per flow (F1 analisis / F2 dokumen / F3 saran alternatif) --------
-# Semua teks TANPA kurung kurawal (audit di build_python_code_template) karena
-# ikut ter-embed ke template kode python str.format {text}.
-
-# F1 — analisis awal: 4 kolom CBT saja; kolom Pikiran Alternatif SEL kosong
-# (diisi manual oleh pasien — guardrail produk: AI tidak boleh langsung
+# Mode analisis (input polos): 4 kolom CBT saja; kolom Pikiran Alternatif SEL
+# kosong (diisi manual oleh pasien — guardrail produk: AI tidak boleh langsung
 # mengisi pikiran alternatif; lihat AGENT_LOG §19).
 PROMPT_ANALYSIS = """\
 Anda adalah Clinical Copilot dari HearMeOut. Anda menerima teks jurnal pasien
@@ -199,28 +112,8 @@ Aturan:
 - Bila teks tidak memuat keluhan yang bisa diekstrak, tetap buat tabel dengan sel "-".
 """
 
-# F2 — pembuatan dokumen: data JSON 5 field diberikan, Bob hanya memanggil tool.
-PROMPT_DOCUMENT = """\
-Anda adalah Clinical Copilot dari HearMeOut. Anda menerima SATU objek JSON yang
-berisi kunci situation, thought, emotion, behavior, alternate_thought — data
-hasil analisis yang sudah jadi. Tugas Anda HANYA membuat dokumen dari data itu.
-
-Langkah wajib Anda:
-1. Panggil tool 'generate_clinical_document' TEPAT SATU KALI dengan kelima nilai
-   dari JSON tersebut (situation, thought, emotion, behavior, alternate_thought).
-2. Setelah tool sukses, akhiri pesan HANYA dengan satu baris:
-   Dokumen: <path file dokumen>
-   Tanpa teks lain sebelum atau sesudahnya.
-3. Bila tool gagal, ulangi tepat satu kali; bila tetap gagal, akhiri pesan
-   HANYA dengan satu baris: ERROR: <pesan error apa adanya>
-
-Aturan:
-- Jangan menganalisis ulang, jangan mengubah atau menambah nilai apa pun.
-- Jangan berikan saran medis atau diagnosa.
-- Bila ada kunci yang kosong, lewati nilainya sebagai string kosong (jangan mengarang).
-"""
-
-# F3 — saran pikiran alternatif (opsi "Saran AI"; pilihan utama tetap manual).
+# Mode alternatif (input "MODE=ALTERNATIF\\n{json}"): saran pikiran alternatif
+# (opsi "Saran AI"; pilihan utama tetap manual).
 PROMPT_ALTERNATE = """\
 Anda adalah Clinical Copilot dari HearMeOut. Anda menerima SATU objek JSON yang
 berisi kunci situation, thought, emotion, behavior dari jurnal pasien.
@@ -232,41 +125,6 @@ dalam bahasa Indonesia, maksimal 2 kalimat.
 Balas HANYA dengan teks pikiran alternatif itu — tanpa tanda kutip, tanpa
 pembuka seperti "Pikiran alternatif:", tanpa penjelasan atau daftar lain,
 tanpa saran medis dan tanpa diagnosa.
-"""
-
-# Prompt LEGACY untuk flow cadangan Gemini (perilaku lama: ekstraksi 5 kolom +
-# tool call + baris Dokumen dalam satu run) — dipertahankan agar e2e jalur
-# gemini tetap valid; UI tidak memakai jalur ini.
-PROMPT_LEGACY_GEMINI = """\
-Anda adalah Clinical Copilot dari HearMeOut. Anda menerima teks jurnal pasien
-(tanpa data pribadi) dan tugas Anda mengekstraknya ke matriks CBT lalu membuat
-dokumen lewat tool yang tersedia.
-
-Langkah wajib Anda:
-1. Analisis teks dan ekstrak ke dalam format JSON dengan kunci:
-   - situation (Situasi/kejadian pemicu)
-   - thought (Pikiran otomatis yang muncul saat kejadian)
-   - emotion (Emosi yang dirasakan)
-   - behavior (Perilaku yang dilakukan)
-   - alternate_thought (Pikiran alternatif yang lebih seimbang — hasil
-     restrukturisasi kognitif ringan, bukan kutipan dari teks)
-2. Setelah ekstraksi selesai, panggil tool 'generate_clinical_document'
-   dengan mengirimkan data JSON tersebut (tepat satu kali per teks masuk).
-3. Setelah tool sukses, akhiri pesan HANYA dengan format berikut (tanpa teks lain):
-   | Situasi | Pikiran | Emosi | Perilaku | Pikiran Alternatif |
-   |---|---|---|---|---|
-   | ... | ... | ... | ... | ... |
-   (satu baris data per situasi; bila teks memuat beberapa situasi, buat beberapa baris)
-
-   Lalu satu baris kosong dan satu baris: Dokumen: <path file dokumen>
-
-Aturan:
-- Jangan berikan saran medis kepada pengguna. Fokus pada ekstraksi data secara objektif.
-- Asumsikan teks jurnal tidak memuat data pribadi; jangan bertanya mengenai identitas pasien.
-- Ekstraksi harus objektif: kutip/parafrase keluhan apa adanya, tanpa diagnosa.
-- Bila panggilan tool gagal, ulangi tepat satu kali, lalu laporkan error apa adanya —
-  jangan pernah menjawab "timeout" atau "server tidak tersedia" tanpa mencoba tool.
-- Bila teks tidak memuat keluhan yang bisa diekstrak, tetap buat tabel dengan sel "-".
 """
 
 
@@ -366,91 +224,7 @@ def edge(
     }
 
 
-def flip_tool_mode(entry: dict) -> None:
-    """Aktifkan tool mode pada node sumber tool (mengikuti _enable_tool_mode lfx).
-
-    template.tool_mode = True dan outputs diganti satu output sintetis
-    component_as_tool (method to_toolkit, selected Tool).
-    """
-    entry["tool_mode"] = True
-    entry["outputs"] = [
-        {
-            "allows_loop": False,
-            "cache": True,
-            "display_name": "Toolset",
-            "group_outputs": False,
-            "hidden": False,
-            "method": "to_toolkit",
-            "name": "component_as_tool",
-            "options": None,
-            "required_inputs": None,
-            "selected": "Tool",
-            "tool_mode": True,
-            "types": ["Tool"],
-            "value": "__UNDEFINED__",
-        }
-    ]
-
-
-def register_mcp_server() -> None:
-    """Daftarkan MCP server tool dokumen ke Langflow (API v2), idempoten."""
-    body = {"url": MCP_SERVER_URL}
-    try:
-        api("GET", f"/api/v2/mcp/servers/{MCP_SERVER_NAME}")
-        api("PATCH", f"/api/v2/mcp/servers/{MCP_SERVER_NAME}", body)
-        print(f"MCP server terdaftar (diupdate): {MCP_SERVER_NAME} → {MCP_SERVER_URL}")
-    except SystemExit:
-        api("POST", f"/api/v2/mcp/servers/{MCP_SERVER_NAME}", body)
-        print(f"MCP server terdaftar (baru): {MCP_SERVER_NAME} → {MCP_SERVER_URL}")
-
-
-def sync_gemini_variable(key: str) -> bool:
-    """Sinkronkan GOOGLE_API_KEY (.env) ke variabel global Langflow.
-
-    Variabel bernama provider (GOOGLE_API_KEY) ditolak oleh PATCH (404) —
-    strateginya: hapus lalu buat ulang (POST). CATATAN: Langflow mem-validasi
-    kunci provider dengan memanggil model sungguhan saat disimpan, jadi kunci
-    placeholder ('xxx') ditolak 400 — hanya kunci asli yang bisa tersimpan.
-
-    Mengembalikan True bila variabel kini punya nilai asli.
-    """
-    variables = api("GET", "/api/v1/variables/")
-    items = variables if isinstance(variables, list) else variables.get("data", [])
-    existing = next((v for v in items if v.get("name") == GEMINI_VAR_NAME), None)
-
-    if key == "xxx":
-        if existing and existing.get("has_value"):
-            print(f"Variabel {GEMINI_VAR_NAME} di Langflow sudah terisi nilai asli — "
-                  "placeholder 'xxx' diabaikan.")
-            return True
-        print(f"PERINGATAN: {GEMINI_VAR_NAME} masih placeholder 'xxx' dan variabel "
-              "Langflow belum terisi — flow tetap dibuat, semua run akan gagal di "
-              "panggilan Gemini sampai kunci asli diisi di .env lalu skrip dijalankan ulang.")
-        return False
-
-    payload = {"name": GEMINI_VAR_NAME, "value": key, "type": "Credential",
-               "default_fields": ["api_key"]}
-    if existing:
-        # PATCH ditolak (404) untuk variabel provider — hapus + buat ulang.
-        try:
-            api("DELETE", f"/api/v1/variables/{existing['id']}")
-        except SystemExit as e:
-            print(f"Catatan: gagal menghapus variabel lama ({e}); lanjut POST.")
-    try:
-        api("POST", "/api/v1/variables/", payload)
-    except SystemExit as e:
-        sys.exit(
-            f"Gagal menyimpan variabel {GEMINI_VAR_NAME} ke Langflow.\n"
-            f"  {e}\n"
-            "  (Langflow mem-validasi kunci provider secara live — pastikan kunci "
-            "Gemini asli, bukan placeholder.)"
-        )
-    print(f"Variabel {GEMINI_VAR_NAME} disinkronkan dari .env (validasi live lolos).")
-    return True
-
-
-def build_python_code_template(instr: str, mode: str = "agent",
-                               disable_mcp: bool = True) -> str:
+def build_python_code_template_multi() -> str:
     """Susun kode Python node Python Interpreter (template dengan {text}).
 
     Kode dijalankan sandbox Langflow: tanpa pernyataan import (validate_code_safety
@@ -459,18 +233,13 @@ def build_python_code_template(instr: str, mode: str = "agent",
     Satu-satunya kurung kurawal di seluruh kode adalah placeholder {text} yang
     dirender oleh node Prompt (str.format).
 
-    mode: 'agent' (tool calling) atau 'ask' (jawaban tunggal, F3).
-    disable_mcp: True → flag --disable-mcp (F1/F3 tak butuh tool; F2 biarkan aktif).
+    Input berawalan "MODE=ALTERNATIF" → PROMPT_ALTERNATE (bob --mode ask);
+    selain itu → PROMPT_ANALYSIS (bob --mode agent). Keduanya --disable-mcp —
+    produk tidak memakai tool; dokumen .docx dibuat di web (library docx).
     """
-    assert "{" not in instr and "}" not in instr, "prompt memuat kurung kurawal"
-    assert "'''" not in instr, "prompt memuat tiga kutip"
-    assert mode in ("agent", "ask")
-    flags = (
-        "'--mode', '" + mode + "', '--format', 'json', "
-        "'--log-level', 'error', '--trust', '--workspace', PROJECT, '--max-turns', "
-        "env.get('BOB_MAX_TURNS', '6'), '--disable-subagents'"
-        + (", '--disable-mcp'" if disable_mcp else "")
-    )
+    for instr in (PROMPT_ANALYSIS, PROMPT_ALTERNATE):
+        assert "{" not in instr and "}" not in instr, "prompt memuat kurung kurawal"
+        assert "'''" not in instr, "prompt memuat tiga kutip"
     code = (
         f"PROJECT = {str(BASE)!r}\n"
         "BOB = os.path.expanduser('~/.local/share/npm/bin/bob')\n"
@@ -487,11 +256,21 @@ def build_python_code_template(instr: str, mode: str = "agent",
         "        print('BOB_GAGAL env: %s' % e)\n"
         "if not env.get('BOB_MAX_TURNS'):\n"
         "    env['BOB_MAX_TURNS'] = '6'\n"
-        "INSTR = '''\n" + instr + "\n'''\n"
-        "prompt = INSTR + '\\n\\nInput:\\n' + '''{text}'''\n"
+        "raw = '''{text}'''\n"
+        "if raw.startswith('MODE=ALTERNATIF'):\n"
+        "    INSTR = '''\n" + PROMPT_ALTERNATE + "\n'''\n"
+        "    MODE_ARGS = ['--mode', 'ask', '--disable-mcp']\n"
+        "    payload = raw[len('MODE=ALTERNATIF'):].strip()\n"
+        "else:\n"
+        "    INSTR = '''\n" + PROMPT_ANALYSIS + "\n'''\n"
+        "    MODE_ARGS = ['--mode', 'agent', '--disable-mcp']\n"
+        "    payload = raw\n"
+        "prompt = INSTR + '\\n\\nInput:\\n' + payload\n"
         "try:\n"
-        "    p = subprocess.run([BOB, 'run', '--accept-license', " + flags +
-        ", prompt], input='', capture_output=True, text=True, timeout=900, env=env, cwd=PROJECT)\n"
+        "    p = subprocess.run([BOB, 'run', '--accept-license', '--format', 'json', "
+        "'--log-level', 'error', '--trust', '--workspace', PROJECT, '--max-turns', "
+        "env.get('BOB_MAX_TURNS', '6'), '--disable-subagents'] + MODE_ARGS + [prompt], "
+        "input='', capture_output=True, text=True, timeout=900, env=env, cwd=PROJECT)\n"
         "    out = p.stdout.strip()\n"
         "    if out:\n"
         "        print(out)\n"
@@ -506,10 +285,7 @@ def build_python_code_template(instr: str, mode: str = "agent",
 
 
 def build_chain_flow(code_template: str, ids: dict, output_display: str) -> dict:
-    """Flow 6 node / 5 edge — rantai Prompt → Python → Parse JSON → Parser.
-
-    Dipakai ketiga flow engine bob; beda hanya kode prompt & label Chat Output.
-    """
+    """Flow 6 node / 5 edge — rantai Prompt → Python → Parse JSON → Parser."""
     catalog = api("GET", "/api/v1/all")
 
     chat_in = catalog_entry(catalog, "input_output", "ChatInput")
@@ -544,7 +320,7 @@ def build_chain_flow(code_template: str, ids: dict, output_display: str) -> dict
     # --- Parser: format dari baris Data (satu Data per baris jq)
     parser["template"]["pattern"]["value"] = "{text}"
 
-    # --- Chat Output: label per tahap produk
+    # --- Chat Output
     chat_out["display_name"] = output_display
 
     nodes = [
@@ -571,129 +347,22 @@ def build_chain_flow(code_template: str, ids: dict, output_display: str) -> dict
     return {"nodes": nodes, "edges": edges, "viewport": {"x": 0, "y": 0, "zoom": 1}}
 
 
-def build_flow_gemini() -> dict:
-    catalog = api("GET", "/api/v1/all")
+def upsert_flow(spec: dict, data: dict) -> str:
+    """PATCH bila flow sudah ada (id_file / nama persis), kalau tidak CREATE.
 
-    chat_in = catalog_entry(catalog, "input_output", "ChatInput")
-    gemini = catalog_entry(catalog, "google", "ext:google:GoogleGenerativeAIComponent@official")
-    mcp_tools = catalog_entry(catalog, "models_and_agents", "MCPTools")
-    agent = catalog_entry(catalog, "models_and_agents", "Agent")
-    chat_out = catalog_entry(catalog, "input_output", "ChatOutput")
-
-    # --- Google Generative AI: model Gemini; api_key = nama variabel global
-    # Langflow (field load_from_db) — nilainya disinkronkan builder dari .env.
-    gemini["template"]["api_key"]["value"] = GEMINI_VAR_NAME
-    gemini["template"]["model_name"]["value"] = GEMINI_MODEL
-    # Wajib untuk tool calling Gemini (langchain-google-genai).
-    gemini["template"]["tool_model_enabled"]["value"] = True
-
-    # --- MCP Tools: hearmeout-tools (generate_clinical_document → .docx)
-    mcp_tools["template"]["mcp_server"]["value"] = {
-        "name": MCP_SERVER_NAME,
-        "config": {"url": MCP_SERVER_URL},
-    }
-    mcp_tools["template"]["headers"]["value"] = {}
-    mcp_tools["template"]["tool"]["value"] = ""  # semua tool (generate_clinical_document)
-    mcp_tools["template"]["tool_execution_timeout"]["value"] = 60.0
-    flip_tool_mode(mcp_tools)
-
-    # --- Agent: otak CBT — instruksi legacy + tool dari MCP Tools, model Gemini
-    agent["template"]["system_prompt"]["value"] = PROMPT_LEGACY_GEMINI
-    agent["template"]["add_calculator_tool"]["value"] = False
-    agent["template"]["add_current_date_tool"]["value"] = False
-
-    # --- Chat Output: "Thought Record" (tabel Markdown + baris Dokumen)
-    chat_out["display_name"] = "Thought Record"
-
-    nodes = [
-        node(chat_in, "ChatInput", IDs["chat_input"], [0, 320]),
-        node(gemini, "ext:google:GoogleGenerativeAIComponent@official", IDs["gemini"], [420, 0]),
-        node(mcp_tools, "MCPTools", IDs["mcp_tools"], [420, 640]),
-        node(agent, "Agent", IDs["agent"], [980, 320]),
-        node(chat_out, "ChatOutput", IDs["chat_output"], [1500, 320]),
-    ]
-    edges = [
-        edge(IDs["chat_input"], "message", ["Message"], "ChatInput",
-             IDs["agent"], "input_value", ["Message"], "str"),
-        edge(IDs["gemini"], "model_output", ["LanguageModel"],
-             "ext:google:GoogleGenerativeAIComponent@official",
-             IDs["agent"], "model", ["LanguageModel"], "model"),
-        edge(IDs["mcp_tools"], "component_as_tool", ["Tool"], "MCPTools",
-             IDs["agent"], "tools", ["Tool"], "other"),
-        edge(IDs["agent"], "response", ["Message"], "Agent",
-             IDs["chat_output"], "input_value",
-             ["Data", "JSON", "DataFrame", "Table", "Message"], "other"),
-    ]
-    return {"nodes": nodes, "edges": edges, "viewport": {"x": 0, "y": 0, "zoom": 1}}
-
-
-def find_existing_flow() -> dict | None:
-    """Cari flow lama supaya di-PATCH (bukan membuat flow baru)."""
-    flow_id_path = BASE / ".flow_id"
-    if flow_id_path.exists():
-        flow_id = flow_id_path.read_text().strip()
-        if flow_id:
-            try:
-                flow = api("GET", f"/api/v1/flows/{flow_id}")
-                if isinstance(flow, dict) and flow.get("id"):
-                    return flow
-            except SystemExit:
-                pass  # id sudah tidak ada — lanjut cari by nama
-    for legacy in LEGACY_FLOW_NAMES:
-        flows = api("GET", f"/api/v1/flows/?name={legacy}")
-        if isinstance(flows, list):
-            found = next((f for f in flows if f.get("name") == legacy), None)
-            if found:
-                return found
-    return None
-
-
-def is_gemini_style(flow: dict) -> bool:
-    """True bila data flow memuat node Google Generative AI (arsitektur cadangan).
-
-    Pakai "GoogleGenerativeAI" (nama komponen) — jangan "GoogleGenAI": itu bukan
-    substring dari "GoogleGenerativeAIComponent" (ada huruf 'e' setelah 'Gen').
+    id disimpan ke file spec["id_file"] agar run berikutnya langsung tahu id.
     """
-    return "GoogleGenerativeAI" in json.dumps(flow.get("data") or {})
-
-
-def find_fallback_flow() -> dict | None:
-    """Cari flow cadangan Gemini ("BriefME (Gemini)") via .flow_id.gemini / nama."""
-    path = BASE / FLOW_ID_GEMINI
+    target = None
+    path = BASE / spec["id_file"]
     if path.exists():
         flow_id = path.read_text().strip()
         if flow_id:
             try:
                 flow = api("GET", f"/api/v1/flows/{flow_id}")
                 if isinstance(flow, dict) and flow.get("id"):
-                    return flow
+                    target = flow
             except SystemExit:
                 pass
-    name = urllib.parse.quote(FALLBACK_FLOW_NAME)
-    flows = api("GET", f"/api/v1/flows/?name={name}")
-    if isinstance(flows, list):
-        found = next((f for f in flows if f.get("name") == FALLBACK_FLOW_NAME), None)
-        if found:
-            return found
-    return None
-
-
-def upsert_flow(spec: dict, data: dict, target: dict | None = None) -> str:
-    """PATCH bila flow sudah ada (target / id_file / nama persis), kalau tidak CREATE.
-
-    id disimpan ke file spec["id_file"] agar run berikutnya langsung tahu id.
-    """
-    if target is None:
-        path = BASE / spec["id_file"]
-        if path.exists():
-            flow_id = path.read_text().strip()
-            if flow_id:
-                try:
-                    flow = api("GET", f"/api/v1/flows/{flow_id}")
-                    if isinstance(flow, dict) and flow.get("id"):
-                        target = flow
-                except SystemExit:
-                    pass
     if target is None:
         q = urllib.parse.quote(spec["name"])
         flows = api("GET", f"/api/v1/flows/?name={q}")
@@ -715,70 +384,18 @@ def upsert_flow(spec: dict, data: dict, target: dict | None = None) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Buat/update flow Langflow BriefME")
-    parser.add_argument("--engine", choices=("bob", "gemini"),
-                        default=os.environ.get("ENGINE", "bob"),
-                        help="bob = arsitektur utama, 3 flow (default); gemini = flow cadangan")
-    args = parser.parse_args()
-    engine = args.engine
-
     load_env_file(BASE / ".env")
     if not os.environ.get("LANGFLOW_API_KEY"):
         sys.exit("Set LANGFLOW_API_KEY dulu (lihat .env)")
+    if not os.environ.get("BOB_API_KEY"):
+        sys.exit("Set BOB_API_KEY dulu di .env (kunci API resmi Bob)")
 
-    # MCP server tool dokumen — dipakai flow F2 (via Bob) dan node MCP Tools
-    # fallback gemini; idempoten sehingga aman dipanggil di kedua engine.
-    register_mcp_server()
-
-    if engine == "bob":
-        if not os.environ.get("BOB_API_KEY"):
-            sys.exit("Set BOB_API_KEY dulu di .env (kunci API resmi Bob)")
-
-        # Migrasi: simpan flow Gemini yang masih menempati primary sebagai
-        # fallback SEBELUM data primary ditimpa dengan data bob.
-        existing = find_existing_flow()
-        if existing and is_gemini_style(existing) and not find_fallback_flow():
-            clone = api("POST", "/api/v1/flows/",
-                        {"name": FALLBACK_FLOW_NAME, "data": existing["data"],
-                         "endpoint_name": FALLBACK_ENDPOINT, "description": DESC_GEMINI})
-            (BASE / FLOW_ID_GEMINI).write_text(clone["id"])
-            print(f"Flow fallback dicloning: {FALLBACK_FLOW_NAME} id={clone['id']} "
-                  f"endpoint {FALLBACK_ENDPOINT}")
-
-        for spec in BOB_FLOWS:
-            instr = globals()[spec["prompt"]]
-            code = build_python_code_template(instr, mode=spec["mode"],
-                                              disable_mcp=spec["disable_mcp"])
-            data = build_chain_flow(code, make_ids(spec["id_suffix"]), spec["display"])
-            hint = existing if spec["key"] == "main" else None
-            upsert_flow(spec, data, target=hint)
-        print("endpoint per tahap:")
-        for spec in BOB_FLOWS:
-            print(f"  {spec['key']:11s} {lf_url()}/api/v1/run/{spec['endpoint']}")
-        return
-
-    # ---- engine gemini (flow cadangan, perilaku legacy) ----
-    gemini_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not gemini_key:
-        sys.exit(f"Set {GEMINI_VAR_NAME} dulu di .env (kunci Gemini untuk node Agent)")
-    sync_gemini_variable(gemini_key)
-
-    data = build_flow_gemini()
-    target = find_fallback_flow()
-    if target:
-        spec = {"name": FALLBACK_FLOW_NAME, "endpoint": FALLBACK_ENDPOINT,
-                "id_file": FLOW_ID_GEMINI, "desc": DESC_GEMINI}
-    else:
-        primary = find_existing_flow()
-        if primary and is_gemini_style(primary):
-            target = primary
-            spec = {"name": FLOW_NAME, "endpoint": ENDPOINT,
-                    "id_file": ".flow_id", "desc": DESC_GEMINI}
-        else:
-            spec = {"name": FALLBACK_FLOW_NAME, "endpoint": FALLBACK_ENDPOINT,
-                    "id_file": FLOW_ID_GEMINI, "desc": DESC_GEMINI}
-    upsert_flow(spec, data, target=target)
-    print(f"endpoint: {lf_url()}/api/v1/run/{spec['endpoint']}")
+    code = build_python_code_template_multi()
+    data = build_chain_flow(code, BOB_IDS, "Thought Record")
+    spec = {"name": FLOW_NAME, "endpoint": ENDPOINT,
+            "id_file": ".flow_id", "desc": DESC}
+    upsert_flow(spec, data)
+    print(f"endpoint: {lf_url()}/api/v1/run/{ENDPOINT}")
 
 
 if __name__ == "__main__":

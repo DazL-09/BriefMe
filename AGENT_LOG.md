@@ -577,3 +577,52 @@ cleanup = agresif; Bob = uninstall penuh.
   server/e2e, payload manual per endpoint, catatan autosave/proxy/`&nbsp;`);
   Agent-Plan §1/§2/§3/§5 + tabel status diperbarui; AGENT_LOG §19 ini.
   Entri uji history dihapus (DB bersih untuk demo).
+
+## 20. Konsolidasi: 1 flow multi-mode, hapus Gemini/MCP, docx via web (11 Okt)
+
+* **Kebutuhan/keputusan user:** "TEPAT 1 flow BriefME" — hapus Gemini total
+  (flow + builder `--engine` + e2e `E2E_ENGINE`); saran AI dihasilkan **saat
+  API dipanggil** lewat awalan `MODE=ALTERNATIF` pada endpoint yang sama (bukan
+  flow terpisah); dokumen `.docx` dibuat di **browser via library** ("tinggal
+  ubah ke docx pake library") — tanpa AI/MCP/tool call.
+* **Flow cleanup (API):** 5 flow dihapus dari Langflow (HTTP 200 semua):
+  Gemini `fcddb060`, Dokumen `f035c624`, Alternatif `ae7cc7b8`, junk `Brief ME`
+  `96cc6d30` (4-node), junk `Briefme` `2e9d37e9` (0-node). Tersisa **hanya**
+  `BriefME` `fb741b8a` (6 node). Starter template Langflow dibiarkan.
+* **Builder ditulis ulang (`scripts/create_langflow_flow.py`, ~450 baris):**
+  `build_python_code_template_multi()` — satu kode node berisi kedua prompt
+  (`PROMPT_ANALYSIS` / `PROMPT_ALTERNATE`) + percabangan
+  `raw.startswith('MODE=ALTERNATIF')` memilih instruksi + `MODE_ARGS`
+  (`--mode agent|ask`, keduanya `--disable-mcp`). Dihapus: `PROMPT_DOCUMENT`,
+  `PROMPT_LEGACY_GEMINI`, `BOB_FLOWS`, `make_ids`, `flip_tool_mode`,
+  `register_mcp_server`, `sync_gemini_variable`, `build_flow_gemini`,
+  `find_fallback_flow`, `is_gemini_style`, `--engine`. Id file: hanya `.flow_id`
+  (`.flow_id.gemini/.dokumen/.alternatif` di-`git rm`).
+* **Preflight offline (`/tmp/opencode/preflight1.py`, venv langflow):** brace/quote
+  kedua prompt, `validate_prompt` → `['text']`, `validate_code_safety` pada dua
+  varian render (jurnal polos & ber-prefix), flag mode, id 6 unik, jq 5 kasus.
+  **Hasil: SEMUA PREFLIGHT 1-FLOW OK.**
+* **Builder live:** `Flow UPDATED: BriefME id=fb741b8a…`; verifikasi via API:
+  6 node / 5 edge, `GoogleGenerativeAI`/`MCPTools`/`ext:google` absen.
+* **Smoke API (single endpoint):** F1 (jurnal polos) **8.3s** — tabel 5 header,
+  sel alt `''`; F3 (`MODE=ALTERNATIF\n{json}`) **7.6s** — satu paragraf saran,
+  tanpa tabel. **SMOKE F1+F3 LOLOS.**
+* **Web:** `npm i docx file-saver` (+`@types/file-saver`). `suggestAI` →
+  `runFlow('briefme', 'MODE=ALTERNATIF\n'+JSON)` (label output `Thought Record`).
+  `makeDocument` → **lokal**: `Document`+`Table` 5 kolom (header + 1 baris data
+  + alt) + catatan objektif-klinis → `Packer.toBlob` → `saveAs`
+  (`briefme-thought-record-<stamp>.docx`); **tanpa** PATCH `documentPath`
+  (kontrak Express dipertahankan, web berhenti mengirim). Hint dokumen →
+  "sebentar (dibuat di browser)". `npm run build` lolos.
+* **E2E ditulis ulang (`scripts/run_e2e.py`, single-endpoint):** preflight
+  (LANGFLOW/BOB key + bob CLI + Express/Mongo; **tanpa** `.bob/mcp.json`/MCP/
+  Gemini) → F1 (guard PII + kebocoran prompt, alt kosong) → F3 prefix (≥15
+  karakter, tanpa tabel/pembuka) → roundtrip history (POST 201, GET, G1/G2/G4
+  400, PATCH 200, G3 400, DELETE 200). **SEMUA PEMERIKSAAN LOLOS 20.0s.**
+* **Playwright (`/tmp/opencode/ui-test/flow.mjs`):** bagian dokumen diganti —
+  `page.waitForEvent('download')` saat klik *Buat Dokumen* → verifikasi nama
+  `briefme-thought-record-*.docx`, ukuran 10171 bytes, `unzip -p word/document.xml`
+  memuat 5 header + seluruh alt + "atasan" + "objektif-klinis". **25/25 LOLOS.**
+* **Docs:** README (diagram 1-flow, docx-via-web, tanpa MCP di jalur produk;
+  payload manual 2 mode; verifikasi 20.0s / 25/25); Agent-Plan §1–5 + tabel
+  status (arsip MCP dicatat); AGENT_LOG §20 ini.

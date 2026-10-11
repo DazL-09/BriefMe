@@ -1,25 +1,21 @@
-"""Pengujian terintegrasi (end-to-end) BriefME — dua engine (E2E_ENGINE=bob|gemini).
+"""Pengujian terintegrasi (end-to-end) BriefME — SATU flow multi-mode.
 
-Alur engine bob (default — arsitektur utama hackathon):
-  1. Preflight: LANGFLOW_API_KEY + BOB_API_KEY + bob CLI + .bob/mcp.json +
-     Langflow hidup + tool MCP terdaftar + Express history API (:8790) + MongoDB
-  2. F1  POST /api/v1/run/briefme             → tabel CBT 4 kolom terisi, kolom
-      "Pikiran Alternatif" KOSONG, TANPA baris "Dokumen:" (AI tidak mengisi alt),
-      guard regex PII + guard kebocoran instruksi prompt
-  3. F3  POST /api/v1/run/briefme-alternatif  → SATU saran pikiran alternatif
-      (>= 15 karakter, tanpa pembuka/preamble)
-  4. F2  POST /api/v1/run/briefme-dokumen (JSON 5 field) → "Dokumen: <path>" +
-      cek fisik .docx: tabel 5 kolom, sel alt terisi (bukan placeholder)
-  5. Roundtrip history Express/MongoDB: POST valid 201, G1 journal pendek 400,
+Alur:
+  1. Preflight: LANGFLOW_API_KEY + BOB_API_KEY + bob CLI + Langflow hidup +
+     Express history API (:8790) + MongoDB
+  2. F1  POST /api/v1/run/briefme (jurnal polos) → tabel CBT 4 kolom terisi,
+       kolom "Pikiran Alternatif" KOSONG, TANPA baris "Dokumen:",
+       guard regex PII + guard kebocoran instruksi prompt
+  3. F3  POST /api/v1/run/briefme (prefix "MODE=ALTERNATIF\\n" + JSON 4 field)
+       → SATU saran pikiran alternatif (>= 15 karakter, tanpa pembuka/preamble)
+  4. Roundtrip history Express/MongoDB: POST valid 201, G1 journal pendek 400,
      analysis kosong 400, documentPath tanpa alt 400 (G4), PATCH alt, DELETE
 
-Engine gemini (E2E_ENGINE=gemini — flow cadangan "BriefME (Gemini)", perilaku
-legacy): preflight GOOGLE_API_KEY kunci asli; satu POST briefme-gemini → tabel
-5 kolom terisi + baris "Dokumen: <path>" dalam satu run; riwayat tetap diuji.
+Dokumen .docx TIDAK diuji di sini — dibuat di browser (web, library docx);
+Playwright flow.mjs yang mengujinya.
 
 Pemakaian:
-    .venv/bin/python scripts/run_e2e.py                       # engine bob
-    E2E_ENGINE=gemini .venv/bin/python scripts/run_e2e.py     # flow cadangan
+    .venv/bin/python scripts/run_e2e.py
     (kunci dari .env — skrip memuatnya sendiri)
 """
 
@@ -55,22 +51,12 @@ def _load_env_file(path: Path) -> None:
 
 _load_env_file(BASE / ".env")
 
-ENGINE = os.environ.get("E2E_ENGINE", "bob")
-if ENGINE not in ("bob", "gemini"):
-    sys.exit(f"E2E_ENGINE tidak dikenal: {ENGINE!r} (pakai bob|gemini)")
-
 LF_URL = os.environ.get("LANGFLOW_URL", "http://127.0.0.1:7860").rstrip("/")
 LF_KEY = os.environ.get("LANGFLOW_API_KEY", "")
 HISTORY_URL = os.environ.get("HISTORY_URL", "http://127.0.0.1:8790").rstrip("/")
-MCP_URL = os.environ.get("MCP_URL", "http://127.0.0.1:8788/mcp")
-GEMINI_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
 BOB_KEY = os.environ.get("BOB_API_KEY", "").strip()
 
-# Endpoint per tahap (engine bob) / endpoint legacy (engine gemini).
-ENDPOINTS = {
-    "bob": {"f1": "briefme", "f3": "briefme-alternatif", "f2": "briefme-dokumen"},
-    "gemini": {"legacy": "briefme-gemini"},
-}
+ENDPOINT = "briefme"
 
 # Jurnal pasien realistis TANPA data pribadi (input flow memang dianggap bersih).
 TEST_TEXT = (
@@ -79,19 +65,17 @@ TEST_TEXT = (
     "Saya takut saya akan dipecat."
 )
 
-# Guard regex PII: input tidak memuat pola ini, jadi output/dokumen tidak boleh.
+# Guard regex PII: input tidak memuat pola ini, jadi output tidak boleh.
 PII_PATTERNS = {
     "nomor HP": re.compile(r"\b0\d{2,4}[-\s]?\d{3,4}[-\s]?\d{3,4}\b"),
     "email": re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]{2,}"),
     "alamat jalan": re.compile(r"\bJl\.\s*\w+", re.I),
 }
-# header tabel Markdown (output) & tabel .docx — urutan sama persis
+# header tabel Markdown (output)
 TABLE_HEADERS = ["Situasi", "Pikiran", "Emosi", "Perilaku", "Pikiran Alternatif"]
-# kata kunci isi teks yang harus muncul di dokumen (selaras dgn TEST_TEXT)
-DOCX_CONTENT_KEYWORDS = ["atasan", "kantor", "dipecat", "berdebar"]
 # nilai pengganti yang berarti "tidak ada isi", bukan hasil ekstraksi nyata
 PLACEHOLDERS = ("tidak disebutkan", "tidak ada", "n/a", "-", "tidak diketahui")
-# potongan prompt (builder) yang tidak boleh bocor ke output flow maupun dokumen
+# potongan prompt (builder) yang tidak boleh bocor ke output flow
 INSTRUCTION_FRAGMENTS = [
     "langkah wajib",
     "analisis teks secara internal",
@@ -105,8 +89,6 @@ INSTRUCTION_FRAGMENTS = [
     "hanya dengan satu baris",
     "tanpa teks lain",
 ]
-# frasa yang memang ada di footer statis template_cbt.docx (bukan kebocoran prompt)
-TEMPLATE_STATIC_TEXT = ("saran medis", "objektif-klinis", "jurnal pasien")
 
 failures: list[str] = []
 
@@ -165,16 +147,16 @@ def item_text(item: dict) -> str:
     return ""
 
 
-def run_flow(endpoint: str, text: str, timeout: int = 1800) -> tuple[dict, float]:
-    """POST /api/v1/run/<endpoint> → ({nama_component: item}, elapsed)."""
+def run_flow(text: str, timeout: int = 1800) -> tuple[dict, float]:
+    """POST /api/v1/run/briefme → ({nama_component: item}, elapsed)."""
     t0 = time.time()
     status, res = request_json(
-        "POST", f"{LF_URL}/api/v1/run/{endpoint}",
+        "POST", f"{LF_URL}/api/v1/run/{ENDPOINT}",
         {"input_value": text, "output_type": "chat", "data_type": "text"},
         headers={"x-api-key": LF_KEY}, timeout=timeout, raise_http=False,
     )
     if status != 200:
-        raise SystemExit(f"HTTP {status} dari run/{endpoint}: {json.dumps(res)[:1000]}")
+        raise SystemExit(f"HTTP {status} dari run/{ENDPOINT}: {json.dumps(res)[:1000]}")
     items: dict[str, dict] = {}
     for out in res.get("outputs", []):
         for item in out.get("outputs", []):
@@ -197,54 +179,29 @@ def md_table_rows(text: str) -> list[list[str]]:
 def preflight() -> bool:
     """Gagal cepat sebelum menyentuh layanan bila prasyarat tidak terpenuhi."""
     ok = True
-    print(f"engine: {ENGINE}  endpoint: {ENDPOINTS[ENGINE]}")
+    print(f"endpoint: {ENDPOINT} (satu flow multi-mode)")
     if not LF_KEY:
         print("[FAIL] LANGFLOW_API_KEY kosong — cek .env")
         ok = False
-    if ENGINE == "bob":
-        if not BOB_KEY or len(BOB_KEY) < 20:
-            print("[FAIL] BOB_API_KEY kosong/pendek di .env — isi kunci API resmi Bob "
-                  "lalu jalankan ulang")
-            ok = False
-        if not (BASE / ".bob" / "mcp.json").exists():
-            print("[FAIL] .bob/mcp.json tidak ada — Bob tak bisa memanggil tool MCP "
-                  "(jalankan builder/pastikan workspace .bob terbentuk)")
-            ok = False
-    else:
-        if not GEMINI_KEY or GEMINI_KEY == "xxx":
-            print("[FAIL] GOOGLE_API_KEY belum diisi kunci asli di .env — flow cadangan "
-                  "butuh Gemini; isi kuncinya lalu jalankan "
-                  "scripts/create_langflow_flow.py --engine gemini ulang")
-            ok = False
+    if not BOB_KEY or len(BOB_KEY) < 20:
+        print("[FAIL] BOB_API_KEY kosong/pendek di .env — isi kunci API resmi Bob "
+              "lalu jalankan ulang")
+        ok = False
     return ok
 
 
 def step1_health() -> None:
     print("\n[1] Health check komponen")
     check("Langflow hidup", get(f"{LF_URL}/health").get("status") == "ok")
-    # MCP: lewat client fastmcp (dipakai Bob via .bob/mcp.json ATAU node MCP Tools)
-    import asyncio
-
-    from fastmcp import Client
-
-    async def tools():
-        async with Client(MCP_URL) as c:
-            return [t.name for t in await c.list_tools()]
-
-    names = asyncio.run(tools())
-    check("Tool MCP generate_clinical_document terdaftar",
-          "generate_clinical_document" in names, ", ".join(names))
-    if ENGINE == "bob":
-        bob = shutil.which("bob") or str(Path.home() / ".local/share/npm/bin/bob")
-        try:
-            out = subprocess.run([bob, "--version"], capture_output=True,
-                                 text=True, timeout=30)
-            ver = (out.stdout or out.stderr).strip().splitlines()[:1]
-            check("bob CLI sehat (bob --version)", out.returncode == 0,
-                  ver[0] if ver else "")
-        except Exception as exc:  # noqa: BLE001 — laporkan apa adanya
-            check("bob CLI sehat (bob --version)", False, str(exc))
-    # Express (history API) + MongoDB — prasyarat penyimpanan riwayat
+    bob_path = shutil.which("bob") or str(Path.home() / ".local/share/npm/bin/bob")
+    try:
+        bob = subprocess.run([bob_path, "--version"], capture_output=True,
+                             text=True, timeout=30)
+        ver = (bob.stdout or bob.stderr).strip().splitlines()[:1]
+        check("bob CLI sehat (bob --version)", bob.returncode == 0,
+              ver[0] if ver else "")
+    except Exception as exc:  # noqa: BLE001 — laporkan apa adanya
+        check("bob CLI sehat (bob --version)", False, str(exc))
     try:
         health = get(f"{HISTORY_URL}/api/health", timeout=10)
         check("Express history API hidup (:8790)", health.get("ok") is True)
@@ -270,9 +227,8 @@ def step2_f1_analysis() -> tuple[list[str], str]:
 
     Mengembalikan (4_sel_cbt, output_teks).
     """
-    print(f"\n[2] F1 — jurnal pasien -> analisis CBT (endpoint "
-          f"{ENDPOINTS['bob']['f1']})")
-    items, dt = run_flow(ENDPOINTS["bob"]["f1"], TEST_TEXT)
+    print(f"\n[2] F1 — jurnal pasien -> analisis CBT (endpoint {ENDPOINT})")
+    items, dt = run_flow(TEST_TEXT)
     print(f"  elapsed: {dt}s")
     thought = item_text(items.get("Thought Record", ""))
     print(f"  output : {thought[:500]}")
@@ -306,127 +262,48 @@ def step2_f1_analysis() -> tuple[list[str], str]:
 
 
 def step3_f3_alternate(cbt: list[str]) -> str:
-    """F3 — saran pikiran alternatif AI (opsi; pasien disarankan menulis manual)."""
-    print(f"\n[3] F3 — saran pikiran alternatif (endpoint "
-          f"{ENDPOINTS['bob']['f3']})")
+    """F3 — saran pikiran alternatif AI (opsi; pasien disarankan menulis manual).
+
+    Input = prefix "MODE=ALTERNATIF\\n" + JSON 4 field — endpoint yang SAMA.
+    """
+    print(f"\n[3] F3 — saran pikiran alternatif (prefix MODE=ALTERNATIF, endpoint "
+          f"{ENDPOINT})")
     if not cbt:
         check("Payload F3 tersedia (dari hasil F1)", False)
         return ""
-    payload = json.dumps({
+    payload = "MODE=ALTERNATIF\n" + json.dumps({
         "situation": cbt[0], "thought": cbt[1],
         "emotion": cbt[2], "behavior": cbt[3],
     }, ensure_ascii=False)
-    items, dt = run_flow(ENDPOINTS["bob"]["f3"], payload)
+    items, dt = run_flow(payload)
     print(f"  elapsed: {dt}s")
-    alt = item_text(items.get("Saran Pikiran Alternatif", ""))
+    alt = item_text(items.get("Thought Record", ""))
     print(f"  output : {alt[:400]}")
-    check("Hanya satu output 'Saran Pikiran Alternatif'",
-          sorted(items) == ["Saran Pikiran Alternatif"], str(sorted(items)))
+    check("Hanya satu output 'Thought Record'", sorted(items) == ["Thought Record"],
+          str(sorted(items)))
     _guard_output_common("F3", alt)
     check("Saran alternatif >= 15 karakter", len(alt.strip()) >= 15,
           f"{len(alt.strip())} karakter")
-    check("Tanpa pembuka 'Pikiran alternatif:' / tanda kutip pembungkus",
-          not alt.strip().startswith(("Pikiran", '"', "'", "Tentu", "Berikut")),
+    check("Tanpa tabel/pembuka — SATU paragraf saran",
+          "|" not in alt and not alt.strip().startswith(
+              ("Pikiran", '"', "'", "Tentu", "Berikut")),
           alt[:80])
     return alt.strip()
 
 
-def step4_f2_document(cbt: list[str], alt: str) -> str:
-    """F2 — dokumen .docx dari JSON 5 field; kembalikan path file."""
-    print(f"\n[4] F2 — pembuatan dokumen (endpoint {ENDPOINTS['bob']['f2']})")
-    if not cbt or not alt:
-        check("Payload F2 lengkap (4 sel CBT + alt dari F3)", False)
-        return ""
-    before = {p.name for p in (BASE / "output").glob("brief_*.docx")}
-    payload = json.dumps({
-        "situation": cbt[0], "thought": cbt[1],
-        "emotion": cbt[2], "behavior": cbt[3],
-        "alternate_thought": alt,
-    }, ensure_ascii=False)
-    items, dt = run_flow(ENDPOINTS["bob"]["f2"], payload)
-    print(f"  elapsed: {dt}s")
-    out = item_text(items.get("Dokumen", ""))
-    print(f"  output : {out[:400]}")
-    check("Hanya satu output 'Dokumen'", sorted(items) == ["Dokumen"],
-          str(sorted(items)))
-    _guard_output_common("F2", out)
-    check("Output F2 = baris 'Dokumen: <path>'", out.strip().startswith("Dokumen:"),
-          out[:200])
-    check("F2 tanpa 'ERROR:' (tool MCP berhasil)", "ERROR:" not in out, out[:200])
+def step4_history_roundtrip(cbt: list[str], alt: str) -> None:
+    """Roundtrip history di Express/MongoDB — guardrail G1/G2/G4/G5.
 
-    m = (re.search(r"(/[\w./-]*/brief_[0-9a-f]{8}\.docx)", out)
-         or re.search(r"(output/brief_[0-9a-f]{8}\.docx)", out))
-    check("Tool MCP mengembalikan path dokumen", bool(m),
-          out[:300] if not m else m.group(1))
-    if not m:
-        return ""
-    path = Path(m.group(1) if m.group(1).startswith("/") else BASE / m.group(1))
-    check("File .docx dibuat & ada", path.exists(), str(path))
-    if path.exists():
-        check("File .docx BARU dibuat pada run ini", path.name not in before,
-              path.name)
-    return str(path) if path.exists() else ""
-
-
-def step5_output_file(doc_path: str, alt: str) -> None:
-    print("\n[5] Cek output fisik (.docx — tabel Thought Record 5 kolom)")
-    if not doc_path:
-        check("Path dokumen tersedia untuk pemeriksaan isi", False)
-        return
-    path = Path(doc_path)
-
-    from docx import Document
-
-    doc = Document(str(path))
-    body_text = "\n".join(p.text for p in doc.paragraphs)
-    table_rows: list[list[str]] = []
-    for table in doc.tables:
-        for row in table.rows:
-            table_rows.append([c.text.strip() for c in row.cells])
-    table_text = "\n".join(" | ".join(r) for r in table_rows)
-    text = body_text + "\n" + table_text
-    print("  --- isi dokumen ---")
-    print("  " + text.replace("\n", "\n  "))
-    lower = text.lower()
-
-    check("Dokumen memuat tabel", bool(doc.tables))
-    if table_rows:
-        check("Header tabel sesuai (5 kolom Indonesia)",
-              table_rows[0] == TABLE_HEADERS, str(table_rows[0]))
-        data_rows = table_rows[1:]
-        check("Ada baris data", bool(data_rows))
-        if data_rows:
-            cells = data_rows[0]
-            check("Semua sel terisi konten nyata",
-                  all(len(c) >= 3 for c in cells), str(cells))
-            check("Sel 'Pikiran Alternatif' berisi alt hasil F3 (bukan placeholder)",
-                  len(cells[4]) >= 15 and cells[4].lower() not in PLACEHOLDERS,
-                  cells[4][:80])
-            if alt:
-                check("Sel alt di dokumen = saran F3", cells[4] == alt,
-                      f"docx={cells[4][:60]!r} vs f3={alt[:60]!r}")
-    hits = [k for k in DOCX_CONTENT_KEYWORDS if k in lower]
-    check("Konten tabel selaras dgn teks input", len(hits) >= 3,
-          f"kata kunci ditemukan: {hits}")
-    leaked_pii = pii_hits(text)
-    check("Dokumen bebas pola PII (regex)", not leaked_pii,
-          f"bocor: {leaked_pii}" if leaked_pii else "")
-    doc_fragments = [f for f in INSTRUCTION_FRAGMENTS if f not in TEMPLATE_STATIC_TEXT]
-    leaked_instr = [f for f in doc_fragments if f in lower]
-    check("Dokumen bebas kebocoran instruksi prompt", not leaked_instr,
-          f"bocor: {leaked_instr}" if leaked_instr else "")
-
-
-def step6_history_roundtrip(cbt: list[str], alt: str, doc_path: str) -> None:
-    """Roundtrip history di Express/MongoDB — guardrail G1/G2/G4/G5."""
-    print("\n[6] Roundtrip history Express/MongoDB (guardrail G1/G2/G4/G5)")
+    documentPath dikirim '' (produk menyimpannya di client-side browser saja).
+    """
+    print("\n[4] Roundtrip history Express/MongoDB (guardrail G1/G2/G4/G5)")
     analysis = {"situation": cbt[0] if cbt else "-", "thought": cbt[1] if cbt else "-",
                 "emotion": cbt[2] if cbt else "-", "behavior": cbt[3] if cbt else "-"}
     full = {
         "journal": TEST_TEXT,
         "analysis": analysis,
         "alternateThought": {"text": alt, "source": "manual"},
-        "documentPath": doc_path,
+        "documentPath": "",
     }
 
     # POST valid → 201
@@ -458,9 +335,10 @@ def step6_history_roundtrip(cbt: list[str], alt: str, doc_path: str) -> None:
     check("G2: analysis kosong → 400", status == 400,
           f"status={status} {json.dumps(body)[:160]}")
 
-    # G4 — documentPath tanpa alt → 400
+    # G4 — documentPath tanpa alt → 400 (kontrak Express tetap ada meski web
+    # tidak lagi mengirim documentPath)
     bad = dict(full, alternateThought={"text": "", "source": ""},
-               documentPath=doc_path or "output/brief_x.docx")
+               documentPath="output/brief_x.docx")
     status, body = request_json("POST", f"{HISTORY_URL}/api/history", bad,
                                 raise_http=False)
     check("G4: documentPath tanpa alternateThought → 400", status == 400,
@@ -493,62 +371,14 @@ def step6_history_roundtrip(cbt: list[str], alt: str, doc_path: str) -> None:
         check("Entri uji dibuat untuk PATCH/DELETE", False)
 
 
-def legacy_gemini() -> tuple[str, str]:
-    """Jalur cadangan Gemini: satu run → tabel 5 kolom + baris Dokumen (legacy)."""
-    print(f"\n[2] Satu POST ke Langflow: jurnal pasien -> "
-          f"Agent (Gemini) -> node MCP Tools -> {ENDPOINTS['gemini']['legacy']}")
-    items, dt = run_flow(ENDPOINTS["gemini"]["legacy"], TEST_TEXT)
-    print(f"  elapsed: {dt}s")
-    print(f"  output : {sorted(items)}")
-    thought = item_text(items.get("Thought Record", {}))
-    print(f"  output : {thought[:500]}")
-    check("Hanya satu output 'Thought Record'", sorted(items) == ["Thought Record"],
-          str(sorted(items)))
-    check("Output Thought Record tidak kosong", bool(thought.strip()))
-    return thought, ""
-
-
-def step_legacy_verify(thought: str) -> str:
-    """Verifikasi output legacy (tabel 5 kolom terisi + baris Dokumen)."""
-    print("\n[3] Verifikasi output legacy (Agent Gemini + tool MCP)")
-    result_str = thought.strip()
-    missing_headers = [h for h in TABLE_HEADERS if h not in result_str]
-    check("Output = tabel Markdown dgn header Indonesia",
-          not missing_headers,
-          f"header hilang: {missing_headers}" if missing_headers else "")
-    _guard_output_common("legacy", result_str)
-    m = (re.search(r"(/[\w./-]*/brief_[0-9a-f]{8}\.docx)", result_str)
-         or re.search(r"(output/brief_[0-9a-f]{8}\.docx)", result_str))
-    check("Tool MCP mengembalikan path dokumen", bool(m),
-          result_str[:300] if not m else m.group(1))
-    if not m:
-        return ""
-    path = Path(m.group(1) if m.group(1).startswith("/") else BASE / m.group(1))
-    check("File .docx dibuat & ada", path.exists(), str(path))
-    return str(path) if path.exists() else ""
-
-
 def main() -> int:
     t0 = time.time()
     if not preflight():
         return 1
     step1_health()
-
-    if ENGINE == "bob":
-        cbt, _ = step2_f1_analysis()
-        alt = step3_f3_alternate(cbt)
-        doc_path = step4_f2_document(cbt, alt)
-        step5_output_file(doc_path, alt)
-        step6_history_roundtrip(cbt, alt, doc_path)
-    else:
-        thought, _ = legacy_gemini()
-        doc_path = step_legacy_verify(thought)
-        step5_output_file(doc_path, alt="")
-        rows = md_table_rows(thought)
-        data = [r for r in rows if len(r) >= 5 and r[0] not in ("Situasi", "")]
-        cbt = data[0][:4] if data and len(data[0]) >= 4 else []
-        alt = data[0][4] if data and len(data[0]) >= 5 else ""
-        step6_history_roundtrip(cbt, alt, doc_path)
+    cbt, _ = step2_f1_analysis()
+    alt = step3_f3_alternate(cbt)
+    step4_history_roundtrip(cbt, alt)
 
     print("\n=== RINGKASAN ===")
     if failures:

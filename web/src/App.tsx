@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useState } from 'react'
 import { AnimatePresence, motion, MotionConfig } from 'framer-motion'
+import {
+  Document as DocxDocument,
+  HeadingLevel,
+  Packer,
+  Paragraph,
+  Table,
+  TableCell,
+  TableRow,
+  TextRun,
+  WidthType,
+} from 'docx'
+import { saveAs } from 'file-saver'
 
 type FlowItem = {
   component_display_name?: string
@@ -295,16 +307,18 @@ export default function App() {
     setError(null)
     setNote(null)
     try {
+      // Satu endpoint briefme — mode dibaca dari awalan input oleh kode node.
       const items = await runFlow(
-        'briefme-alternatif',
-        JSON.stringify({
-          situation: analysis.situation,
-          thought: analysis.thought,
-          emotion: analysis.emotion,
-          behavior: analysis.behavior,
-        }),
+        'briefme',
+        'MODE=ALTERNATIF\n' +
+          JSON.stringify({
+            situation: analysis.situation,
+            thought: analysis.thought,
+            emotion: analysis.emotion,
+            behavior: analysis.behavior,
+          }),
       )
-      const suggestion = extractText(items['Saran Pikiran Alternatif']).trim()
+      const suggestion = extractText(items['Thought Record']).trim()
       if (!suggestion || suggestion.startsWith('BOB_GAGAL')) {
         setError('Saran AI kosong/gagal — silakan tulis sendiri.')
         setAltMode('manual')
@@ -339,40 +353,81 @@ export default function App() {
     }
   }
 
-  async function makeDocument() {
-    if (busy || !analysis || !altValid) return // G4 — dokumen hanya setelah alt valid
+  function makeDocument() {
+    // G4 — dokumen hanya setelah alt valid; dibuat lokal di browser (library
+    // docx + file-saver), TANPA AI/tool call dan tanpa menyimpan path di server.
+    if (busy || !analysis || !altValid) return
     setBusy('doc')
     setError(null)
     setNote(null)
     try {
-      const items = await runFlow(
-        'briefme-dokumen',
-        JSON.stringify({
-          situation: analysis.situation,
-          thought: analysis.thought,
-          emotion: analysis.emotion,
-          behavior: analysis.behavior,
-          alternate_thought: alt.text,
-        }),
-      )
-      const out = extractText(items['Dokumen']).trim()
-      if (out.startsWith('ERROR')) {
-        setError(`Pembuatan dokumen gagal: ${out}`)
-        return
-      }
-      const path = /Dokumen:\s*(\S+)/.exec(out)?.[1]
-      if (!path) {
-        setError('Output dokumen tidak memuat baris "Dokumen: <path>".')
-        return
-      }
-      setDocPath(path)
-      if (savedId) {
-        const res = await historyRequest('PATCH', `/${savedId}`, {
-          documentPath: path,
+      const headers = TABLE_HEADERS
+      const row = [
+        analysis.situation,
+        analysis.thought,
+        analysis.emotion,
+        analysis.behavior,
+        alt.text,
+      ]
+      const cell = (text: string) =>
+        new TableCell({
+          children: [
+            new Paragraph({ children: [new TextRun({ text, size: 22 })] }),
+          ],
         })
-        if (!res.ok) setNote(`Riwayat gagal diperbarui: ${historyError(res.data)}`)
-        void refreshHistory()
-      }
+      const table = new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        rows: [
+          new TableRow({
+            children: headers.map((h) =>
+              new TableCell({
+                children: [
+                  new Paragraph({
+                    children: [new TextRun({ text: h, bold: true, size: 22 })],
+                  }),
+                ],
+              }),
+            ),
+          }),
+          new TableRow({ children: row.map((c) => cell(c || '—')) }),
+        ],
+      })
+      const doc = new DocxDocument({
+        sections: [
+          {
+            children: [
+              new Paragraph({
+                heading: HeadingLevel.HEADING_1,
+                children: [new TextRun('Thought Record — Matriks CBT')],
+              }),
+              new Paragraph({
+                children: [
+                  new TextRun({
+                    text: 'Dokumen dibuat otomatis oleh HearMeOut (web)',
+                    italics: true,
+                    color: '666666',
+                  }),
+                ],
+              }),
+              table,
+              new Paragraph({
+                children: [
+                  new TextRun({
+                    text: 'Catatan: dokumen ini bersifat objektif-klinis, berisi ekstraksi data saja tanpa saran medis. Teks bersumber dari jurnal pasien (tanpa data pribadi).',
+                    size: 18,
+                    color: '444444',
+                  }),
+                ],
+              }),
+            ],
+          },
+        ],
+      })
+      void Packer.toBlob(doc).then((blob) => {
+        const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')
+        saveAs(blob, `briefme-thought-record-${stamp}.docx`)
+        setDocPath('(unduhan browser)')
+      })
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -428,7 +483,7 @@ export default function App() {
   const busyHint: Record<Exclude<Busy, null>, string> = {
     analyze: '± 10 detik (Bob menganalisis)',
     ai: '± 10 detik (Bob menyarankan)',
-    doc: '± 10 detik (Bob membuat dokumen)',
+    doc: 'sebentar (dibuat di browser)',
   }
 
   return (
@@ -441,7 +496,7 @@ export default function App() {
               <h1>HearMeOut</h1>
               <p>
                 Clinical Journaling Copilot — jurnal → Bob Agent → Thought Record +
-                pikiran alternatif + dokumen
+                pikiran alternatif + dokumen (.docx dibuat di browser)
               </p>
             </div>
             <button
@@ -693,7 +748,7 @@ export default function App() {
                       <div className="actions">
                         <button
                           type="button"
-                          onClick={() => void makeDocument()}
+                          onClick={() => makeDocument()}
                           disabled={busy !== null || !altValid} // G4
                         >
                           {busy === 'doc' ? busyLabel.doc : 'Buat Dokumen'}
