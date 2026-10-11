@@ -13,3 +13,6 @@ web/*.tsbuildinfo
 
 # Dokumen hasil generate (audit.jsonl tetap dilacak)
 output/*.docx
+
+# Backend MERN
+server/node_modules/

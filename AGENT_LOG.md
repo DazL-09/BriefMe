@@ -507,3 +507,73 @@ cleanup = agresif; Bob = uninstall penuh.
 * **Web:** hero "jurnal → Bob Agent → Thought Record + dokumen"; hint
   "(Bob + dokumen)"; footer transparansi AI (bantuan AI — bukan diagnosis);
   `npm run build` lolos.
+
+## 19. Fitur baru: 3 flow tahapan + history MERN + guardrail alt (11 Okt)
+
+* **Kebutan/keputusan user:** history pakai **stack MERN** (MongoDB + Express +
+  React); pikiran alternatif **TIDAK diisi otomatis** saat analisis — tombol
+  manual (**disarankan**) / saran AI (opsi) di tahap analisis; dokumen `.docx`
+  dibuat **setelah alt terisi** (tombol "Buat Dokumen"); buang tombol "Pakai
+  contoh" + placeholder netral "Ceritakan pengalaman hari ini apa adanya…";
+  push GitHub **ditunda** ("jgn git local dlu"); kriteria rubric README
+  menyusul (user akan paste); tab editor autosave **sudah ditutup**; deck PR
+  urusan user.
+* **Guardrails (disepakati & diuji):** G1 klien — curhatan kosong → tombol
+  disabled, <40 karakter / <8 kata → tolak, ≥60% non-huruf ATAU ≥70% kata
+  berulang → "bukan curhatan", >4000 → tolak; G2 analisis kosong **tidak
+  disimpan** ke history; G3 alt <5 karakter / placeholder (`-`, `n/a`,
+  `tidak ada`, `tidak diketahui`, `tidak disebutkan`) → blokir simpan; G4
+  tombol dokumen hanya bila alt valid; G5 Express revalidasi semua tulis
+  (journal 40–4000, 4 field analisis wajib, `source ∈ {manual,ai}`,
+  `documentPath` butuh alt) → 400.
+* **MongoDB Docker:** image `mongo:7` ditarik → kontainer `briefme-mongo`
+  (`:27017`, `--restart unless-stopped`). **Express `server/index.js`**
+  (:8790): Mongoose schema journal/analysis{4}/alternate{text,source}/
+  documentPath + timestamps; routes GET/POST/PATCH/DELETE `/api/history` +
+  `/api/health`. Semua kasus uji endpoint hijau (201/200/400 per guardrail).
+  `.env.example` += `MONGODB_URI`, `PORT`; `.gitignore` += `server/node_modules/`.
+* **Builder refactor → 3 flow (`BOB_FLOWS`):** rantai 6 node/5 edge dipakai
+  ulang via `build_chain_flow(code, ids, display)`; `make_ids(suffix)` →
+  `HEARB` (F1), `HEARD` (F2), `HEARA` (F3); `build_python_code_template(instr,
+  mode, disable_mcp)` menambah flag `--mode agent|ask` + `--disable-mcp`;
+  `upsert_flow(spec, …)` (id_file → nama persis → CREATE; id disimpan ke
+  `.flow_id`, `.flow_id.dokumen`, `.flow_id.alternatif`). Prompt lama
+  `AGENT_SYSTEM_PROMPT` dipecah: **`PROMPT_ANALYSIS`** (4 kolom, alt kosong
+  total tanpa `&nbsp;`, tanpa tool/JSON mentah), **`PROMPT_DOCUMENT`** (tool
+  sekali → HANYA `Dokumen: <path>` / `ERROR:`), **`PROMPT_ALTERNATE`** (mode
+  ask → satu kalimat ≤2 kalimat) + **`PROMPT_LEGACY_GEMINI`** untuk fallback.
+* **Preflight offline (venv langflow) sebelum builder live:** `validate_prompt`
+  → `['text']` ketiga kode; `validate_code_safety` lolos; jq lolos; id node 18
+  unik; assert prompt tanpa kurung kurawal/`'''` + flag per flow. **Hasil
+  builder: 1 UPDATED + 2 CREATED** lalu rebuild idempoten (3 UPDATED, struktur
+  6 node/5 edge terverifikasi per flow).
+* **Smoke test per flow (API):** F1 **8.1s** — tabel murni, sel alt kosong,
+  tanpa `Dokumen:` (sebelumnya Bob menempel **JSON mentah** sebelum tabel →
+  prompt F1 diperkuat "JSON hanya internal"); F3 **8.7s** — satu kalimat
+  seimbang; F2 **10.1s** — tool MCP → `brief_ac0553c7.docx` baru. Sel kosong
+  F1 kadang `&nbsp;` → dilarang prompt + dinormalisasi UI/e2e.
+* **E2E ditulis ulang (`scripts/run_e2e.py`):** preflight += Express
+  `:8790/api/health` + `db=up`; tahap F1 (5 header, sel alt **kosong**, tanpa
+  baris dokumen) → F3 (≥15 karakter) → F2 (JSON 5 field, docx **baru**,
+  kolom alt = teks F3) → cek fisik docx → **roundtrip history** (POST 201, GET
+  list, G1/G2/G4 → 400, PATCH 200, G3 → 400, DELETE 200). Jalur gemini legacy
+  dipertahankan. **Hasil: SEMUA LOLOS 34.4s.**
+* **Web rework:** `vite.config.ts` — proxy `/api/history` → Express :8790
+  **sebelum** catch-all `/api` → Langflow (urutan wajib; HMR restart otomatis).
+  `App.tsx` — state machine alur: Analisis (G1) → tabel + panel "Pikiran
+  Alternatif" (Tulis sendiri disarankan / Saran AI ops → editor + badge `AI`,
+  G3) → "Buat Dokumen" (G4) → path docx; auto-save history saat analisis +
+  PATCH alt/docx; panel Riwayat (buka → pulihkan jurnal+alt+doc, hapus +
+  confirm); placeholder netral; tanpa "Pakai contoh"; `&nbsp;` dinormalisasi.
+  `npm run build` (tsc+vite) lolos; CSS baru (badge, riwayat, next-step, note,
+  dark-mode).
+* **Uji browser Playwright (`/tmp/opencode/ui-test/flow.mjs`): 19/19 LOLOS** —
+  placeholder netral, G1 hint+disabled, tabel 5 header, sel alt `—`, G4 belum
+  ada, G3 tolak alt `ab`, saran AI masuk editor + badge, dokumen dibuat
+  (`brief_e8bbe38b.docx`), riwayat auto-save + Buka pulihkan jurnal & alt.
+  (2 bug di skrip test murni: locator "Sarankan AI" vs label "Saran AI (opsi)",
+  dan menunggu label busy yang tidak ada di tombol AI — UI tidak diubah.)
+* **Docs:** README diarsitektur ulang (diagram 3 flow + MERN, run steps mongo/
+  server/e2e, payload manual per endpoint, catatan autosave/proxy/`&nbsp;`);
+  Agent-Plan §1/§2/§3/§5 + tabel status diperbarui; AGENT_LOG §19 ini.
+  Entri uji history dihapus (DB bersih untuk demo).
